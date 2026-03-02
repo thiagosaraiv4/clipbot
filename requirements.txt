@@ -1,0 +1,37 @@
+# ─────────────────────────────────────────────────────────────────
+# ClipBot v2.4 — requirements.txt
+# Entrypoint: app.py  (pywebview, SEM Flask / SocketIO)
+# ─────────────────────────────────────────────────────────────────
+
+# ── GUI Desktop (pywebview) ───────────────────────────────────────
+pywebview>=5.0.5          # janela nativa — edgechromium (Win) / gtk (Linux)
+Pillow>=10.0.0            # dep do pywebview para ícones/imagens
+
+# ── Captura de stream ─────────────────────────────────────────────
+streamlink>=6.0.0         # resolve URLs de Twitch / Kick / YouTube Live
+requests>=2.31.0          # YouTube Data API v3 (busca live ativa)
+
+# ── Análise de áudio ──────────────────────────────────────────────
+numpy>=1.24.0             # análise RMS do pipe FFmpeg (sem librosa)
+
+# ── Legendas automáticas (Whisper) ───────────────────────────────
+openai-whisper>=20230918  # transcrição de áudio → SRT
+torch>=2.0.0              # dep do Whisper (CPU funciona; CUDA opcional)
+
+# ── Upload TikTok ─────────────────────────────────────────────────
+playwright>=1.40.0        # Chromium headless para upload TikTok
+
+# ── Upload Instagram ──────────────────────────────────────────────
+instagrapi>=2.0.0         # Reels via API privada Instagram
+
+# ── Upload YouTube Shorts ─────────────────────────────────────────
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+
+# ── Geração de descrições com IA ─────────────────────────────────
+anthropic>=0.26.0         # Claude API — título, descrição, hashtags
+
+# ── Build (PyInstaller) ───────────────────────────────────────────
+pyinstaller>=6.0.0

@@ -1,0 +1,2221 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ClipBot v2.0</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap"
+    rel="stylesheet">
+  <style>
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0
+    }
+
+    :root {
+      --bg: #09090b;
+      --surface: #111113;
+      --surface2: #18181b;
+      --border: rgba(255, 255, 255, 0.06);
+      --text: hsl(240, 5%, 84%);
+      --muted: hsl(240, 4%, 46%);
+      --accent: #6366f1;
+      --accent2: #818cf8;
+      --green: #10b981;
+      --red: #ef4444;
+      --amber: #f59e0b;
+      --purple: #a855f7;
+      --cyan: #06b6d4;
+    }
+
+    html,
+    body {
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', sans-serif;
+      font-size: 14px
+    }
+
+    body {
+      background-image: linear-gradient(to right, rgba(255, 255, 255, 0.015) 1px, transparent 1px), linear-gradient(to bottom, rgba(255, 255, 255, 0.015) 1px, transparent 1px);
+      background-size: 32px 32px
+    }
+
+    ::-webkit-scrollbar {
+      width: 5px
+    }
+
+    ::-webkit-scrollbar-track {
+      background: transparent
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--surface2);
+      border-radius: 99px
+    }
+
+    #app {
+      display: flex;
+      height: 100vh;
+      overflow: hidden
+    }
+
+    /* Sidebar */
+    #sidebar {
+      width: 220px;
+      min-width: 220px;
+      background: rgba(9, 9, 11, 0.95);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column
+    }
+
+    .logo {
+      height: 64px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 20px;
+      border-bottom: 1px solid var(--border)
+    }
+
+    .logo-icon {
+      width: 32px;
+      height: 32px;
+      background: var(--accent);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 20px rgba(99, 102, 241, 0.4)
+    }
+
+    .logo-icon svg {
+      width: 18px;
+      height: 18px;
+      fill: white
+    }
+
+    .logo-text {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: .05em;
+      color: #fff
+    }
+
+    .nav {
+      flex: 1;
+      padding: 16px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px
+    }
+
+    .nav-section {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--muted);
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      padding: 6px 10px 4px;
+      margin-top: 8px
+    }
+
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 12px;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all .15s;
+      color: var(--muted);
+      font-weight: 500;
+      font-size: 13px;
+      border: none;
+      background: none;
+      width: 100%;
+      text-align: left
+    }
+
+    .nav-item svg {
+      width: 15px;
+      height: 15px;
+      flex-shrink: 0
+    }
+
+    .nav-item:hover {
+      color: var(--text);
+      background: rgba(255, 255, 255, .04)
+    }
+
+    .nav-item.active {
+      color: var(--accent2);
+      background: rgba(99, 102, 241, .1)
+    }
+
+    .sidebar-footer {
+      padding: 14px;
+      border-top: 1px solid var(--border)
+    }
+
+    .btn-save {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 9px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      transition: all .15s
+    }
+
+    .btn-save:hover {
+      background: #27272a
+    }
+
+    /* Main */
+    #main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden
+    }
+
+    #header {
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 28px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(9, 9, 11, .7);
+      flex-shrink: 0
+    }
+
+    .engine-status {
+      display: flex;
+      align-items: center;
+      gap: 10px
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--red);
+      transition: all .3s
+    }
+
+    .status-dot.running {
+      background: var(--green);
+      box-shadow: 0 0 10px rgba(16, 185, 129, .5);
+      animation: pulse 2s infinite
+    }
+
+    .status-dot.stopping {
+      background: var(--amber)
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: 1
+      }
+
+      50% {
+        opacity: .5
+      }
+    }
+
+    .status-text {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .05em
+    }
+
+    .status-text span {
+      color: var(--text)
+    }
+
+    .btn-engine {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 22px;
+      border-radius: 10px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all .15s;
+      border: none;
+      letter-spacing: .05em
+    }
+
+    .btn-engine.start {
+      background: var(--accent);
+      color: #fff;
+      box-shadow: 0 4px 20px rgba(99, 102, 241, .3)
+    }
+
+    .btn-engine.start:hover {
+      background: #4f46e5
+    }
+
+    .btn-engine.stop {
+      background: rgba(239, 68, 68, .1);
+      color: var(--red);
+      border: 1px solid rgba(239, 68, 68, .2)
+    }
+
+    .btn-engine.stop:hover {
+      background: rgba(239, 68, 68, .15)
+    }
+
+    .btn-engine.stopping {
+      background: rgba(245, 158, 11, .1);
+      color: var(--amber);
+      border: 1px solid rgba(245, 158, 11, .2);
+      cursor: not-allowed
+    }
+
+    #content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px 28px
+    }
+
+    /* Cards */
+    .grid {
+      display: grid;
+      gap: 16px
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(2, 1fr)
+    }
+
+    .grid-1-2 {
+      grid-template-columns: 1fr 2fr
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between
+    }
+
+    .card-title {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--muted)
+    }
+
+    .card-body {
+      display: flex;
+      flex-direction: column;
+      gap: 10px
+    }
+
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px
+    }
+
+    .stat-label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .1em;
+      margin-bottom: 6px
+    }
+
+    .stat-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 32px;
+      font-weight: 300
+    }
+
+    .stat-card.accent .stat-label {
+      color: rgba(99, 102, 241, .7)
+    }
+
+    .stat-card.accent .stat-value {
+      color: var(--accent2)
+    }
+
+    .stat-card.green .stat-label {
+      color: rgba(16, 185, 129, .7)
+    }
+
+    .stat-card.green .stat-value {
+      color: var(--green)
+    }
+
+    /* Terminal */
+    .terminal {
+      background: #050507;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow-y: auto;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      line-height: 1.8;
+      flex: 1
+    }
+
+    .log-line {
+      display: flex;
+      gap: 12px;
+      padding: 1px 4px;
+      border-radius: 4px
+    }
+
+    .log-line:hover {
+      background: rgba(255, 255, 255, .02)
+    }
+
+    .log-time {
+      color: #3f3f46;
+      flex-shrink: 0
+    }
+
+    .log-INFO {
+      color: var(--green);
+      text-shadow: 0 0 8px rgba(16, 185, 129, .2)
+    }
+
+    .log-WARNING {
+      color: var(--amber)
+    }
+
+    .log-ERROR {
+      color: var(--red)
+    }
+
+    .log-DEBUG {
+      color: #3f3f46
+    }
+
+    /* Inputs */
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px
+    }
+
+    .form-label {
+      font-size: 11px;
+      color: var(--muted);
+      font-weight: 500
+    }
+
+    .input {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 9px;
+      padding: 9px 12px;
+      font-size: 13px;
+      width: 100%;
+      outline: none;
+      transition: border .15s;
+      font-family: 'Inter', sans-serif
+    }
+
+    .input:focus {
+      border-color: rgba(99, 102, 241, .5)
+    }
+
+    .input::placeholder {
+      color: #3f3f46
+    }
+
+    select.input {
+      cursor: pointer
+    }
+
+    /* Toggle */
+    .toggle-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 4px 0
+    }
+
+    .toggle-info .toggle-title {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text)
+    }
+
+    .toggle-info .toggle-desc {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 2px
+    }
+
+    .toggle {
+      position: relative;
+      width: 38px;
+      height: 22px;
+      flex-shrink: 0;
+      cursor: pointer
+    }
+
+    .toggle input {
+      opacity: 0;
+      width: 0;
+      height: 0
+    }
+
+    .toggle-track {
+      position: absolute;
+      inset: 0;
+      background: #27272a;
+      border-radius: 99px;
+      transition: .2s
+    }
+
+    .toggle-track::after {
+      content: '';
+      position: absolute;
+      left: 3px;
+      top: 3px;
+      width: 16px;
+      height: 16px;
+      background: #71717a;
+      border-radius: 50%;
+      transition: .2s
+    }
+
+    .toggle input:checked+.toggle-track {
+      background: var(--accent)
+    }
+
+    .toggle input:checked+.toggle-track::after {
+      left: 19px;
+      background: #fff
+    }
+
+    /* Slider */
+    .slider-row {
+      display: flex;
+      flex-direction: column;
+      gap: 8px
+    }
+
+    .slider-header {
+      display: flex;
+      justify-content: space-between
+    }
+
+    .slider-label {
+      font-size: 13px;
+      color: var(--muted)
+    }
+
+    .slider-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      color: var(--accent2)
+    }
+
+    input[type=range] {
+      -webkit-appearance: none;
+      width: 100%;
+      height: 4px;
+      border-radius: 99px;
+      background: #27272a;
+      outline: none
+    }
+
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      border-radius: 9px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all .15s;
+      border: none
+    }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--border)
+    }
+
+    .btn-ghost:hover {
+      color: var(--text);
+      background: rgba(255, 255, 255, .04)
+    }
+
+    .btn-icon {
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 9px;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--muted);
+      transition: all .15s
+    }
+
+    .btn-icon:hover {
+      color: var(--text)
+    }
+
+    /* Chips */
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 3px 8px;
+      border-radius: 99px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .05em
+    }
+
+    .chip-tiktok {
+      background: rgba(6, 182, 212, .1);
+      color: var(--cyan);
+      border: 1px solid rgba(6, 182, 212, .2)
+    }
+
+    .chip-youtube {
+      background: rgba(239, 68, 68, .1);
+      color: var(--red);
+      border: 1px solid rgba(239, 68, 68, .2)
+    }
+
+    .chip-instagram {
+      background: rgba(168, 85, 247, .1);
+      color: var(--purple);
+      border: 1px solid rgba(168, 85, 247, .2)
+    }
+
+    .chip-audio_spike {
+      background: rgba(245, 158, 11, .1);
+      color: var(--amber);
+      border: 1px solid rgba(245, 158, 11, .2)
+    }
+
+    .chip-chat_flood {
+      background: rgba(99, 102, 241, .1);
+      color: var(--accent2);
+      border: 1px solid rgba(99, 102, 241, .2)
+    }
+
+    .chip-keyword {
+      background: rgba(16, 185, 129, .1);
+      color: var(--green);
+      border: 1px solid rgba(16, 185, 129, .2)
+    }
+
+    /* Clips */
+    .clips-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+      gap: 14px
+    }
+
+    .clip-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      transition: border .15s
+    }
+
+    .clip-card:hover {
+      border-color: rgba(99, 102, 241, .3)
+    }
+
+    .clip-thumb {
+      background: #0a0a0d;
+      aspect-ratio: 9/16;
+      max-height: 150px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      position: relative;
+      overflow: hidden
+    }
+
+    .clip-thumb-placeholder {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted)
+    }
+
+    .clip-thumb-placeholder svg {
+      width: 28px;
+      height: 28px;
+      opacity: .4
+    }
+
+    .clip-thumb-placeholder span {
+      font-size: 10px;
+      opacity: .5
+    }
+
+    .clip-info {
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px
+    }
+
+    .clip-name {
+      font-size: 10px;
+      color: var(--muted);
+      font-family: 'JetBrains Mono', monospace;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap
+    }
+
+    .clip-meta {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap
+    }
+
+    .clip-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 2px;
+      flex-wrap: wrap
+    }
+
+    .upload-btn {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 5px 10px;
+      border-radius: 7px;
+      font-size: 10px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all .15s;
+      border: 1px solid;
+      text-transform: uppercase;
+      letter-spacing: .05em
+    }
+
+    .upload-btn.tiktok {
+      background: rgba(6, 182, 212, .08);
+      color: var(--cyan);
+      border-color: rgba(6, 182, 212, .2)
+    }
+
+    .upload-btn.tiktok:hover {
+      background: rgba(6, 182, 212, .15)
+    }
+
+    .upload-btn.youtube {
+      background: rgba(239, 68, 68, .08);
+      color: var(--red);
+      border-color: rgba(239, 68, 68, .2)
+    }
+
+    .upload-btn.youtube:hover {
+      background: rgba(239, 68, 68, .15)
+    }
+
+    .upload-btn.instagram {
+      background: rgba(168, 85, 247, .08);
+      color: var(--purple);
+      border-color: rgba(168, 85, 247, .2)
+    }
+
+    .upload-btn.instagram:hover {
+      background: rgba(168, 85, 247, .15)
+    }
+
+    .upload-btn:disabled {
+      opacity: .35;
+      cursor: not-allowed
+    }
+
+    /* Format picker */
+    .format-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px
+    }
+
+    .format-opt {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      transition: all .15s;
+      background: transparent
+    }
+
+    .format-opt:hover {
+      border-color: rgba(255, 255, 255, .12);
+      background: rgba(255, 255, 255, .02)
+    }
+
+    .format-opt.active {
+      border-color: rgba(99, 102, 241, .5);
+      background: rgba(99, 102, 241, .07)
+    }
+
+    .format-opt svg {
+      width: 28px;
+      height: 28px;
+      color: var(--muted)
+    }
+
+    .format-opt.active svg {
+      color: var(--accent2)
+    }
+
+    .format-opt-label {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted)
+    }
+
+    .format-opt.active .format-opt-label {
+      color: var(--accent2)
+    }
+
+    .format-opt-sub {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: #3f3f46
+    }
+
+    /* Channel */
+    .channel-row {
+      display: flex;
+      gap: 8px;
+      align-items: center
+    }
+
+    .channel-row .input {
+      flex: 1
+    }
+
+    .btn-add-channel {
+      width: 100%;
+      padding: 9px;
+      border: 1px dashed rgba(255, 255, 255, .1);
+      background: transparent;
+      color: var(--muted);
+      border-radius: 9px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      transition: all .15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px
+    }
+
+    .btn-add-channel:hover {
+      border-color: rgba(99, 102, 241, .4);
+      color: var(--accent2);
+      background: rgba(99, 102, 241, .04)
+    }
+
+    /* Modal */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, .8);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+      opacity: 0;
+      pointer-events: none;
+      transition: .2s
+    }
+
+    .modal-overlay.open {
+      opacity: 1;
+      pointer-events: all
+    }
+
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      width: 480px;
+      max-width: 94vw;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px
+    }
+
+    .modal-video {
+      width: 100%;
+      aspect-ratio: 9/16;
+      max-height: 70vh;
+      background: #000;
+      border-radius: 10px;
+      outline: none;
+      display: block
+    }
+
+    .modal-video.horizontal {
+      aspect-ratio: 16/9
+    }
+
+    .modal-loading {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      padding: 40px 20px;
+      color: var(--muted);
+      font-size: 13px
+    }
+
+    .spinner {
+      width: 32px;
+      height: 32px;
+      border: 3px solid rgba(99, 102, 241, .2);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .7s linear infinite
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg)
+      }
+    }
+
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between
+    }
+
+    .modal-title {
+      font-size: 15px;
+      font-weight: 600
+    }
+
+    /* Toast */
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      z-index: 200
+    }
+
+    .toast-item {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 16px;
+      font-size: 13px;
+      animation: slideIn .2s ease;
+      max-width: 320px
+    }
+
+    .toast-item.success {
+      border-color: rgba(16, 185, 129, .3);
+      color: var(--green)
+    }
+
+    .toast-item.error {
+      border-color: rgba(239, 68, 68, .3);
+      color: var(--red)
+    }
+
+    .toast-item.info {
+      border-color: rgba(99, 102, 241, .3);
+      color: var(--accent2)
+    }
+
+    @keyframes slideIn {
+      from {
+        transform: translateX(100%);
+        opacity: 0
+      }
+
+      to {
+        transform: translateX(0);
+        opacity: 1
+      }
+    }
+
+    .divider {
+      height: 1px;
+      background: var(--border);
+      margin: 4px 0
+    }
+
+    .empty {
+      text-align: center;
+      padding: 40px 20px;
+      color: var(--muted);
+      font-size: 13px;
+      font-family: 'JetBrains Mono', monospace
+    }
+
+    .tab-content {
+      display: none
+    }
+
+    .tab-content.active {
+      display: block
+    }
+
+    /* ── Momentos ────────────────────────────────────────────────────────────── */
+    .moments-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 18px
+    }
+
+    .moments-title {
+      font-size: 18px;
+      font-weight: 600
+    }
+
+    .moments-sub {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 2px
+    }
+
+    .moments-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 14px
+    }
+
+    .moment-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: border .15s;
+      position: relative
+    }
+
+    .moment-card:hover {
+      border-color: rgba(99, 102, 241, .3)
+    }
+
+    .moment-card.generating {
+      opacity: .7;
+      pointer-events: none
+    }
+
+    .moment-card.done {
+      border-color: rgba(16, 185, 129, .4);
+      opacity: .55;
+      transition: opacity .4s
+    }
+
+    .mc-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap
+    }
+
+    .mc-chips {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap
+    }
+
+    .mc-time {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      color: var(--muted);
+      white-space: nowrap
+    }
+
+    .mc-body {
+      display: flex;
+      flex-direction: column;
+      gap: 6px
+    }
+
+    .mc-channel {
+      font-size: 11px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap
+    }
+
+    .mc-range {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--text)
+    }
+
+    .mc-score-wrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 2px
+    }
+
+    .mc-score-bar {
+      flex: 1;
+      height: 4px;
+      background: #27272a;
+      border-radius: 99px;
+      overflow: hidden
+    }
+
+    .mc-score-fill {
+      height: 100%;
+      border-radius: 99px;
+      background: var(--accent);
+      transition: width .4s
+    }
+
+    .mc-score-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      color: var(--accent2);
+      width: 34px;
+      text-align: right
+    }
+
+    .mc-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 2px
+    }
+
+    .mc-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 5px 10px;
+      border-radius: 8px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all .15s;
+      border: 1px solid;
+      white-space: nowrap
+    }
+
+    .mc-btn.top {
+      background: rgba(245, 158, 11, .1);
+      color: var(--amber);
+      border-color: rgba(245, 158, 11, .25)
+    }
+
+    .mc-btn.top:hover {
+      background: rgba(245, 158, 11, .2)
+    }
+
+    .mc-btn.approve {
+      background: rgba(16, 185, 129, .1);
+      color: var(--green);
+      border-color: rgba(16, 185, 129, .25)
+    }
+
+    .mc-btn.approve:hover {
+      background: rgba(16, 185, 129, .2)
+    }
+
+    .mc-btn.generate {
+      background: rgba(99, 102, 241, .12);
+      color: var(--accent2);
+      border-color: rgba(99, 102, 241, .3)
+    }
+
+    .mc-btn.generate:hover {
+      background: rgba(99, 102, 241, .2)
+    }
+
+    .mc-btn.reject {
+      background: rgba(239, 68, 68, .08);
+      color: var(--red);
+      border-color: rgba(239, 68, 68, .2);
+      margin-left: auto
+    }
+
+    .mc-btn.reject:hover {
+      background: rgba(239, 68, 68, .15)
+    }
+
+    .mc-btn:disabled {
+      opacity: .35;
+      cursor: not-allowed
+    }
+
+    .mc-spinner {
+      width: 12px;
+      height: 12px;
+      border: 2px solid rgba(99, 102, 241, .3);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      flex-shrink: 0
+    }
+
+    .nav-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 4px;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 99px;
+      font-size: 9px;
+      font-weight: 700;
+      margin-left: auto
+    }
+  </style>
+</head>
+
+<body>
+  <div id="app">
+    <div id="sidebar">
+      <div class="logo">
+        <div class="logo-icon"><svg viewBox="0 0 24 24">
+            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+          </svg></div>
+        <span class="logo-text">CLIPBOT</span>
+      </div>
+      <nav class="nav">
+        <div class="nav-section">Menu</div>
+        <button class="nav-item active" data-tab="dashboard">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="7" height="7" />
+            <rect x="14" y="3" width="7" height="7" />
+            <rect x="14" y="14" width="7" height="7" />
+            <rect x="3" y="14" width="7" height="7" />
+          </svg>
+          Dashboard
+        </button>
+        <button class="nav-item" data-tab="clips">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="23 7 16 12 23 17 23 7" />
+            <rect x="1" y="5" width="15" height="14" rx="2" />
+          </svg>
+          Clips
+        </button>
+        <button class="nav-item" data-tab="moments">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2a10 10 0 1 0 10 10" />
+            <polyline points="12 6 12 12 16 14" />
+            <path d="M22 2 L18 6 M18 2 L22 6" />
+          </svg>
+          Momentos
+          <span class="nav-badge" id="momentsBadge" style="display:none">0</span>
+        </button>
+        <button class="nav-item" data-tab="sources">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="2" />
+            <path
+              d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14" />
+          </svg>
+          Sources
+        </button>
+        <button class="nav-item" data-tab="destinations">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="17 8 12 3 7 8" />
+            <line x1="12" y1="3" x2="12" y2="15" />
+          </svg>
+          Destinations
+        </button>
+        <button class="nav-item" data-tab="triggers">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+          </svg>
+          Triggers
+        </button>
+        <button class="nav-item" data-tab="processing">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14" />
+          </svg>
+          Processing
+        </button>
+      </nav>
+      <div class="sidebar-footer">
+        <button class="btn-save" onclick="saveConfig()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+            <polyline points="17 21 17 13 7 13 7 21" />
+            <polyline points="7 3 7 8 15 8" />
+          </svg>
+          Save Config
+        </button>
+      </div>
+    </div>
+
+    <div id="main">
+      <div id="header">
+        <div class="engine-status">
+          <div class="status-dot" id="statusDot"></div>
+          <div class="status-text">Engine Status: <span id="statusText">STOPPED</span></div>
+        </div>
+        <button class="btn-engine start" id="engineBtn" onclick="toggleEngine()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="5 3 19 12 5 21 5 3" />
+          </svg>
+          START ENGINE
+        </button>
+      </div>
+
+      <div id="content">
+        <!-- DASHBOARD -->
+        <div class="tab-content active" id="tab-dashboard">
+          <div class="grid grid-1-2" style="height:calc(100vh - 120px)">
+            <div style="display:flex;flex-direction:column;gap:14px">
+              <div class="grid" style="grid-template-columns:1fr 1fr">
+                <div class="stat-card accent">
+                  <div class="stat-label">Clips Today</div>
+                  <div class="stat-value" id="statToday">0</div>
+                </div>
+                <div class="stat-card green">
+                  <div class="stat-label">Total Clips</div>
+                  <div class="stat-value" id="statTotal">0</div>
+                </div>
+              </div>
+              <div class="card" style="flex:1;min-height:0">
+                <div class="card-header">
+                  <span class="card-title">Recent Clips</span>
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)"
+                    id="clipCount">0 items</span>
+                </div>
+                <div style="overflow-y:auto;flex:1;min-height:0;display:flex;flex-direction:column;gap:8px"
+                  id="recentClipsList">
+                  <div class="empty">No clips generated yet.</div>
+                </div>
+              </div>
+            </div>
+            <div class="card" style="min-height:0">
+              <div class="card-header">
+                <span class="card-title">System Terminal</span>
+                <button class="btn-icon" onclick="clearLogs()" title="Clear">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="3 6 5 6 21 6" />
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                  </svg>
+                </button>
+              </div>
+              <div class="terminal" id="terminal" style="flex:1;min-height:0"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- CLIPS -->
+        <div class="tab-content" id="tab-clips">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px">
+            <div>
+              <div style="font-size:18px;font-weight:600">Clip Gallery</div>
+              <div style="font-size:12px;color:var(--muted);margin-top:2px">Gerencie e faça upload manual dos seus clips
+              </div>
+            </div>
+            <button class="btn btn-ghost" onclick="loadClips()">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="23 4 23 10 17 10" />
+                <polyline points="1 20 1 14 7 14" />
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+              </svg>
+              Refresh
+            </button>
+          </div>
+          <div class="clips-grid" id="clipsGrid">
+            <div class="empty" style="grid-column:1/-1">Clique em Refresh para carregar clips.</div>
+          </div>
+        </div>
+
+        <!-- MOMENTS -->
+        <div class="tab-content" id="tab-moments">
+          <div class="moments-header">
+            <div>
+              <div class="moments-title">Momentos Detectados</div>
+              <div class="moments-sub">Revise e aprove antes de gerar o clip — <span id="momentsApprovalStatus"
+                  style="color:var(--accent2)">carregando…</span></div>
+            </div>
+            <button class="btn btn-ghost" onclick="buildMomentsTab()">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="23 4 23 10 17 10" />
+                <polyline points="1 20 1 14 7 14" />
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+              </svg>
+              Refresh
+            </button>
+          </div>
+          <div class="moments-grid" id="momentsGrid">
+            <div class="empty" style="grid-column:1/-1">Carregando momentos…</div>
+          </div>
+        </div>
+
+        <!-- SOURCES -->
+        <div class="tab-content" id="tab-sources">
+          <div class="grid grid-2" id="sourcesGrid"></div>
+        </div>
+
+        <!-- DESTINATIONS -->
+        <div class="tab-content" id="tab-destinations">
+          <div class="grid grid-2" id="destGrid"></div>
+        </div>
+
+        <!-- TRIGGERS -->
+        <div class="tab-content" id="tab-triggers">
+          <div class="grid grid-2" id="triggersGrid"></div>
+        </div>
+
+        <!-- PROCESSING -->
+        <div class="tab-content" id="tab-processing">
+          <div class="grid grid-2" id="processingGrid"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal preview -->
+  <div class="modal-overlay" id="previewModal" onclick="closeModal(event)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <span class="modal-title" id="modalTitle">Preview</span>
+        <button class="btn-icon" onclick="closeModal()">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </div>
+      <div id="modalBody">
+        <div class="modal-loading">
+          <div class="spinner"></div>Carregando vídeo…
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn btn-ghost" onclick="openInExplorer()" style="font-size:11px">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+            <polyline points="15 3 21 3 21 9" />
+            <line x1="10" y1="14" x2="21" y2="3" />
+          </svg>
+          Abrir no Explorer
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    // ── Globals ─────────────────────────────────────────────────────────────────
+    let config = {};
+    let activeTab = 'dashboard';
+    let engineRunning = false;
+
+    // pywebview expõe a API quando pronta
+    const api = () => window.pywebview?.api;
+
+    // Chamado pelo Python após window.loaded
+    window._initConfig = function (cfg) {
+      config = cfg;
+      buildSourcesTab();
+      buildDestTab();
+      buildTriggersTab();
+      buildProcessingTab();
+      refreshStatus();
+    };
+
+    // ── pywebview bridge ────────────────────────────────────────────────────────
+    // Aguarda API ficar disponível antes de chamar
+    function callApi(method, ...args) {
+      return new Promise((resolve, reject) => {
+        let tries = 0;
+        const attempt = () => {
+          if (api() && api()[method]) {
+            api()[method](...args).then(resolve).catch(reject);
+          } else if (++tries < 40) {
+            setTimeout(attempt, 100);
+          } else {
+            reject(new Error('pywebview API não disponível'));
+          }
+        };
+        attempt();
+      });
+    }
+
+    // ── Callbacks chamados pelo Python ──────────────────────────────────────────
+    function onEngineStatus(status) {
+      setEngineUI(status);
+    }
+
+    function onNewClip(info) {
+      document.getElementById('statToday').textContent =
+        parseInt(document.getElementById('statToday').textContent || 0) + 1;
+      document.getElementById('statTotal').textContent =
+        parseInt(document.getElementById('statTotal').textContent || 0) + 1;
+      prependRecentClip(info);
+    }
+
+    function onUploadResult(d) {
+      const icon = d.ok ? '✅' : '❌';
+      toast(`${icon} Upload ${d.platform}: ${d.clip}`, d.ok ? 'success' : 'error');
+    }
+
+    // ── Engine ───────────────────────────────────────────────────────────────────
+    async function toggleEngine() {
+      if (engineRunning) {
+        setEngineUI('stopping');
+        await callApi('stop_engine');
+      } else {
+        setEngineUI('running');
+        const r = await callApi('start_engine');
+        if (!r.ok) { setEngineUI('stopped'); toast('❌ ' + r.error, 'error'); }
+      }
+    }
+
+    function setEngineUI(state) {
+      const dot = document.getElementById('statusDot');
+      const txt = document.getElementById('statusText');
+      const btn = document.getElementById('engineBtn');
+      dot.className = 'status-dot ' + state;
+      txt.textContent = state.toUpperCase();
+      engineRunning = (state === 'running');
+      if (state === 'running') {
+        btn.className = 'btn-engine stop';
+        btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12"/></svg> STOP ENGINE`;
+      } else if (state === 'stopping') {
+        btn.className = 'btn-engine stopping';
+        btn.innerHTML = `⏳ HALTING...`;
+      } else {
+        btn.className = 'btn-engine start';
+        btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> START ENGINE`;
+      }
+    }
+
+    async function refreshStatus() {
+      try {
+        const s = await callApi('get_status');
+        setEngineUI(s.running ? 'running' : 'stopped');
+        document.getElementById('statToday').textContent = s.clips_today || 0;
+        document.getElementById('statTotal').textContent = s.clips_total || 0;
+      } catch (e) { }
+      setTimeout(refreshStatus, 5000);
+    }
+
+    // ── Tabs ─────────────────────────────────────────────────────────────────────
+    document.querySelectorAll('.nav-item[data-tab]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const tab = btn.dataset.tab;
+        activeTab = tab;
+        document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+        document.getElementById('tab-' + tab).classList.add('active');
+        document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+        btn.classList.add('active');
+        if (tab === 'clips') loadClips();
+        if (tab === 'moments') buildMomentsTab();
+      });
+    });
+
+    // ── Terminal ─────────────────────────────────────────────────────────────────
+    function addLog(level, msg, time) {
+      const t = document.getElementById('terminal');
+      const div = document.createElement('div');
+      div.className = 'log-line';
+      div.innerHTML = `<span class="log-time">[${time || now()}]</span><span class="log-${level}">${esc(msg)}</span>`;
+      t.appendChild(div);
+      if (t.children.length > 300) t.removeChild(t.firstChild);
+      t.scrollTop = t.scrollHeight;
+    }
+    function clearLogs() { document.getElementById('terminal').innerHTML = ''; }
+    function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+    function now() { return new Date().toLocaleTimeString(); }
+
+    // ── Recent clips (dashboard) ─────────────────────────────────────────────────
+    function prependRecentClip(d) {
+      const list = document.getElementById('recentClipsList');
+      const empty = list.querySelector('.empty');
+      if (empty) empty.remove();
+      const reason = d.reason || 'audio_spike';
+      const div = document.createElement('div');
+      div.style.cssText = 'display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:10px;padding:10px 12px;gap:8px';
+      div.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:4px;min-width:0">
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent2)">${d.time || now()}</span>
+        <span class="chip chip-${reason}">${reason.replace('_', ' ')}</span>
+      </div>
+      <span style="font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${d.channel || ''}</span>
+    </div>
+    <div style="display:flex;gap:4px;flex-shrink:0">
+      ${(d.platforms || []).map(p => `<span class="chip chip-${p}">${p}</span>`).join('')}
+    </div>`;
+      list.insertBefore(div, list.firstChild);
+      document.getElementById('clipCount').textContent = list.children.length + ' items';
+    }
+
+    // ── Clips gallery ────────────────────────────────────────────────────────────
+    async function loadClips() {
+      const grid = document.getElementById('clipsGrid');
+      grid.innerHTML = '<div class="empty" style="grid-column:1/-1">Carregando...</div>';
+      const clips = await callApi('get_clips');
+      if (!clips.length) {
+        grid.innerHTML = '<div class="empty" style="grid-column:1/-1">Nenhum clip encontrado.</div>';
+        return;
+      }
+      const tt = config?.upload?.tiktok?.enabled;
+      const yt = config?.upload?.youtube?.enabled;
+      const ig = config?.upload?.instagram?.enabled;
+      grid.innerHTML = '';
+      clips.forEach(c => {
+        const card = document.createElement('div');
+        card.className = 'clip-card';
+
+        // Blindagem contra quebra de aspas e barras (\) do Windows
+        const pEnc = encodeURIComponent(c.path);
+        const nEnc = encodeURIComponent(c.name);
+
+        card.innerHTML = `
+      <div class="clip-thumb" onclick="previewClip(decodeURIComponent('${pEnc}'), decodeURIComponent('${nEnc}'))">
+        <div class="clip-thumb-placeholder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+          <span>${c.size_mb}MB</span>
+        </div>
+      </div>
+      <div class="clip-info">
+        <div class="clip-name" title="${esc(c.name)}">${esc(c.name)}</div>
+        <div class="clip-meta">
+          <span class="chip chip-${c.reason || 'audio_spike'}">${(c.reason || 'spike').replace('_', ' ')}</span>
+          <span style="font-size:10px;color:var(--muted)">${c.modified}</span>
+        </div>
+        <div class="clip-actions">
+          <button class="upload-btn tiktok" onclick="uploadClip(decodeURIComponent('${pEnc}'), 'tiktok', this)" ${tt ? '' : 'disabled'}>
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.27 6.27 0 0 0-.79-.05A6.34 6.34 0 0 0 3.15 15.2a6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34V8.69a8.18 8.18 0 0 0 4.79 1.52V6.76a4.85 4.85 0 0 1-1.02-.07z"/></svg>
+            TikTok
+          </button>
+          <button class="upload-btn youtube" onclick="uploadClip(decodeURIComponent('${pEnc}'), 'youtube', this)" ${yt ? '' : 'disabled'}>
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.95-1.96C18.88 4 12 4 12 4s-6.88 0-8.59.46A2.78 2.78 0 0 0 1.46 6.42 29 29 0 0 0 1 12a29 29 0 0 0 .46 5.58 2.78 2.78 0 0 0 1.95 1.96C5.12 20 12 20 12 20s6.88 0 8.59-.46a2.78 2.78 0 0 0 1.96-1.96A29 29 0 0 0 23 12a29 29 0 0 0-.46-5.58zM9.75 15.02V8.98L15.5 12l-5.75 3.02z"/></svg>
+            YT
+          </button>
+          <button class="upload-btn instagram" onclick="uploadClip(decodeURIComponent('${pEnc}'), 'instagram', this)" ${ig ? '' : 'disabled'}>
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/></svg>
+            IG
+          </button>
+          <button class="btn-icon" onclick="deleteClip(decodeURIComponent('${pEnc}'), this.closest('.clip-card'))" title="Deletar" style="margin-left:auto;width:28px;height:28px;border-color:rgba(239,68,68,.15);color:var(--red)">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          </button>
+        </div>
+      </div>`;
+        grid.appendChild(card);
+      });
+    }
+
+    async function uploadClip(path, platform, btn) {
+      btn.disabled = true;
+      btn.textContent = '...';
+      toast(`📤 Enviando para ${platform}...`, 'info');
+      await callApi('upload_clip', path, [platform]);
+    }
+
+    async function deleteClip(path, card) {
+      if (!confirm('Deletar este clip?')) return;
+      const r = await callApi('delete_clip', path);
+      if (r.ok) { card.remove(); toast('🗑️ Clip deletado', 'info'); }
+      else toast('❌ ' + r.error, 'error');
+    }
+
+    // ── Video Preview ────────────────────────────────────────────────────────────
+    let _previewPath = '';
+    let _previewObjectURL = null;
+
+    async function previewClip(path, name) {
+      _previewPath = path;
+      document.getElementById('modalTitle').textContent = name;
+
+      const body = document.getElementById('modalBody');
+      body.innerHTML = '<div class="modal-loading"><div class="spinner"></div>Carregando vídeo…</div>';
+      document.getElementById('previewModal').classList.add('open');
+
+      try {
+        // Python inicia servidor local e retorna URL http://127.0.0.1:PORT/arquivo.mp4
+        const r = await callApi('read_video_base64', path);
+        if (!r.ok) throw new Error(r.error || 'Falha ao obter URL do vídeo');
+
+        // Libera URL anterior se existir
+        if (_previewObjectURL) URL.revokeObjectURL(_previewObjectURL);
+        _previewObjectURL = r.url; // agora é uma URL direta, não blob
+
+        const isHoriz = name.toLowerCase().includes('horizontal');
+        body.innerHTML = `
+      <video class="modal-video ${isHoriz ? 'horizontal' : ''}"
+             src="${r.url}"
+             controls autoplay muted
+             preload="auto">
+      </video>`;
+
+      } catch (err) {
+        body.innerHTML = `
+      <div class="modal-loading" style="color:var(--red)">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        Erro ao carregar vídeo<br>
+        <span style="font-size:11px;opacity:.6">${esc(err.message)}</span>
+      </div>`;
+      }
+    }
+
+    function openInExplorer() {
+      if (_previewPath) callApi('open_in_explorer', _previewPath);
+    }
+
+    function closeModal(e) {
+      if (e && e.target !== document.getElementById('previewModal')) return;
+
+      document.getElementById('previewModal').classList.remove('open');
+
+      // Pausa vídeo e libera memória
+      const vid = document.querySelector('.modal-video');
+      if (vid) { vid.pause(); vid.src = ''; }
+      if (_previewObjectURL) {
+        URL.revokeObjectURL(_previewObjectURL);
+        _previewObjectURL = null;
+      }
+      document.getElementById('modalBody').innerHTML =
+        '<div class="modal-loading"><div class="spinner"></div>Carregando vídeo…</div>';
+    }
+
+    // ── Sources tab ──────────────────────────────────────────────────────────────
+    function buildSourcesTab() {
+      const grid = document.getElementById('sourcesGrid');
+      grid.innerHTML = '';
+      [
+        { id: 'twitch', label: 'Twitch', color: '#9146ff' },
+        { id: 'kick', label: 'Kick', color: '#53fc18' },
+        { id: 'youtube', label: 'YouTube Live', color: '#ff0000' },
+      ].forEach(p => {
+        const cfg = config?.platforms?.[p.id] || {};
+        const channels = Array.isArray(cfg.channels) ? cfg.channels : [];
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.innerHTML = `
+      <div class="card-header">
+        <span class="card-title" style="color:${p.color}">${p.label}</span>
+        <label class="toggle"><input type="checkbox" ${cfg.enabled ? 'checked' : ''} onchange="updatePath(['platforms','${p.id}','enabled'],this.checked)"><div class="toggle-track"></div></label>
+      </div>
+      <div class="card-body" id="chs-${p.id}">
+        ${channels.map((ch, i) => `
+          <div class="channel-row">
+            <input class="input" placeholder="Canal ou URL" value="${esc(ch)}" oninput="updateCh('${p.id}',${i},this.value)">
+            <button class="btn-icon" onclick="removeCh('${p.id}',${i})"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+          </div>`).join('')}
+      </div>
+      <button class="btn-add-channel" onclick="addCh('${p.id}')">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Adicionar canal
+      </button>`;
+        grid.appendChild(card);
+      });
+    }
+
+    function getChs(p) { return Array.isArray(config?.platforms?.[p]?.channels) ? config.platforms[p].channels : []; }
+    function addCh(p) { getChs(p).push(''); updatePath(['platforms', p, 'channels'], [...getChs(p)]); buildSourcesTab(); }
+    function removeCh(p, i) { const a = getChs(p); a.splice(i, 1); updatePath(['platforms', p, 'channels'], [...a]); buildSourcesTab(); }
+    function updateCh(p, i, v) { const a = getChs(p); a[i] = v; updatePath(['platforms', p, 'channels'], [...a]); }
+
+    // ── Destinations tab ─────────────────────────────────────────────────────────
+    function buildDestTab() {
+      const up = config?.upload || {}, tt = up.tiktok || {}, yt = up.youtube || {}, ig = up.instagram || {};
+      document.getElementById('destGrid').innerHTML = `
+    <div class="card">
+      <div class="card-header"><span class="card-title" style="color:var(--cyan)">TikTok</span>
+        <label class="toggle"><input type="checkbox" ${tt.enabled ? 'checked' : ''} onchange="updatePath(['upload','tiktok','enabled'],this.checked)"><div class="toggle-track"></div></label>
+      </div>
+      <div class="form-group"><label class="form-label">Session ID</label>
+        <input class="input" type="password" placeholder="ece57192..." value="${esc(tt.session_id || '')}" oninput="updatePath(['upload','tiktok','session_id'],this.value)">
+      </div>
+      <div style="font-size:11px;color:var(--muted)">F12 → Application → Cookies → tiktok.com → sessionid</div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title" style="color:var(--red)">YouTube Shorts</span>
+        <label class="toggle"><input type="checkbox" ${yt.enabled ? 'checked' : ''} onchange="updatePath(['upload','youtube','enabled'],this.checked)"><div class="toggle-track"></div></label>
+      </div>
+      <div class="form-group"><label class="form-label">youtube_credentials.json</label>
+        <input class="input" placeholder="C:/Users/.../youtube_credentials.json" value="${esc(yt.credentials_path || yt.client_secrets_file || '')}" oninput="updatePath(['upload','youtube','credentials_path'],this.value)">
+      </div>
+      <div style="font-size:11px;color:var(--muted)">console.cloud.google.com → YouTube Data API v3 → OAuth</div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title" style="color:var(--purple)">Instagram Reels</span>
+        <label class="toggle"><input type="checkbox" ${ig.enabled ? 'checked' : ''} onchange="updatePath(['upload','instagram','enabled'],this.checked)"><div class="toggle-track"></div></label>
+      </div>
+      <div class="form-group"><label class="form-label">Usuário</label>
+        <input class="input" placeholder="@usuario" value="${esc(ig.username || ig.user || '')}" oninput="updatePath(['upload','instagram','username'],this.value)">
+      </div>
+      <div class="form-group" style="margin-top:8px"><label class="form-label">Senha</label>
+        <input class="input" type="password" placeholder="••••••••" value="${esc(ig.password || '')}" oninput="updatePath(['upload','instagram','password'],this.value)">
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">Upload Settings</span></div>
+      <div class="slider-row">
+        <div class="slider-header"><span class="slider-label">Max clips/dia</span><span class="slider-val" id="v-maxday">${up.max_per_day || 10}</span></div>
+        <input type="range" min="1" max="50" value="${up.max_per_day || 10}" oninput="document.getElementById('v-maxday').textContent=this.value;updatePath(['upload','max_per_day'],+this.value)">
+      </div>
+      <div class="slider-row" style="margin-top:14px">
+        <div class="slider-header"><span class="slider-label">Delay entre posts</span><span class="slider-val" id="v-delay">${up.delay_sec || 300}s</span></div>
+        <input type="range" min="30" max="3600" value="${up.delay_sec || 300}" oninput="document.getElementById('v-delay').textContent=this.value+'s';updatePath(['upload','delay_sec'],+this.value)">
+      </div>
+    </div>`;
+    }
+
+    // ── Triggers tab ─────────────────────────────────────────────────────────────
+    function buildTriggersTab() {
+      const det = config?.detection || {};
+      const kw = typeof det.keywords_list === 'string' ? det.keywords_list : (det.keywords || []).join(', ');
+      document.getElementById('triggersGrid').innerHTML = `
+    <div class="card">
+      <div class="card-header"><span class="card-title">Detection Triggers</span></div>
+      <div class="card-body">
+        <div class="toggle-row">
+          <div class="toggle-info"><div class="toggle-title">🔊 Audio Spike</div><div class="toggle-desc">Detecta aumento brusco de volume</div></div>
+          <label class="toggle"><input type="checkbox" ${det.audio_spike !== false ? 'checked' : ''} onchange="updatePath(['detection','audio_spike'],this.checked)"><div class="toggle-track"></div></label>
+        </div>
+        <div class="divider"></div>
+        <div class="toggle-row">
+          <div class="toggle-info"><div class="toggle-title">💬 Chat Flood</div><div class="toggle-desc">Detecta explosão de mensagens no chat</div></div>
+          <label class="toggle"><input type="checkbox" ${det.chat_flood !== false ? 'checked' : ''} onchange="updatePath(['detection','chat_flood'],this.checked)"><div class="toggle-track"></div></label>
+        </div>
+        <div class="divider"></div>
+        <div class="toggle-row">
+          <div class="toggle-info"><div class="toggle-title">🔑 Keywords</div><div class="toggle-desc">Dispara quando palavras específicas aparecem</div></div>
+          <label class="toggle"><input type="checkbox" ${det.keywords !== false ? 'checked' : ''} onchange="updatePath(['detection','keywords'],this.checked)"><div class="toggle-track"></div></label>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">Sensitivity</span></div>
+      <div class="slider-row">
+        <div class="slider-header"><span class="slider-label">Audio Threshold</span><span class="slider-val" id="v-audio">+${det.threshold_db || 20}dB</span></div>
+        <input type="range" min="5" max="50" value="${det.threshold_db || 20}" oninput="document.getElementById('v-audio').textContent='+'+this.value+'dB';updatePath(['detection','threshold_db'],+this.value)">
+      </div>
+      <div class="slider-row" style="margin-top:14px">
+        <div class="slider-header"><span class="slider-label">Chat Flood Rate</span><span class="slider-val" id="v-flood">${det.flood_rate || 10} msg/s</span></div>
+        <input type="range" min="3" max="50" value="${det.flood_rate || 10}" oninput="document.getElementById('v-flood').textContent=this.value+' msg/s';updatePath(['detection','flood_rate'],+this.value)">
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">Clip Duration</span></div>
+      <div class="slider-row">
+        <div class="slider-header"><span class="slider-label">Mínimo</span><span class="slider-val" id="v-min">${det.clip_min_sec || 30}s</span></div>
+        <input type="range" min="5" max="120" value="${det.clip_min_sec || 30}" oninput="document.getElementById('v-min').textContent=this.value+'s';updatePath(['detection','clip_min_sec'],+this.value)">
+      </div>
+      <div class="slider-row" style="margin-top:14px">
+        <div class="slider-header"><span class="slider-label">Máximo</span><span class="slider-val" id="v-max">${det.clip_max_sec || 60}s</span></div>
+        <input type="range" min="10" max="180" value="${det.clip_max_sec || 60}" oninput="document.getElementById('v-max').textContent=this.value+'s';updatePath(['detection','clip_max_sec'],+this.value)">
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">Keywords</span></div>
+      <div class="form-group"><label class="form-label">Palavras separadas por vírgula</label>
+        <input class="input" placeholder="clip, insano, KKKK, omg..." value="${esc(kw)}" oninput="updatePath(['detection','keywords_list'],this.value)">
+      </div>
+    </div>`;
+    }
+
+    // ── Processing tab ───────────────────────────────────────────────────────────
+    function buildProcessingTab() {
+      const ed = config?.editing || {}, sys = config?.system || {};
+      const subOn = ed.subtitles !== false;
+      const subLang = ed.language || 'pt';
+      const subSize = ed.font_size || 16;
+      const subClr = ed.subtitle_color || 'yellow';
+      const fmt = ed.format || 'vertical';
+      document.getElementById('processingGrid').innerHTML = `
+    <div class="card">
+      <div class="card-header"><span class="card-title">Output Format</span></div>
+      <div class="format-grid">
+        <div class="format-opt ${fmt !== 'horizontal' ? 'active' : ''}" onclick="setFormat('vertical')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="7" y="2" width="10" height="20" rx="2"/></svg>
+          <div class="format-opt-label">Vertical</div><div class="format-opt-sub">9:16 · TikTok / Shorts</div>
+        </div>
+        <div class="format-opt ${fmt === 'horizontal' ? 'active' : ''}" onclick="setFormat('horizontal')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="7" width="20" height="10" rx="2"/></svg>
+          <div class="format-opt-label">Horizontal</div><div class="format-opt-sub">16:9 · YouTube</div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">AI Subtitles (Whisper)</span></div>
+      <div class="toggle-row">
+        <div class="toggle-info"><div class="toggle-title">Legendas automáticas</div><div class="toggle-desc">Transcreve e adiciona legendas no clip</div></div>
+        <label class="toggle"><input type="checkbox" ${subOn ? 'checked' : ''} onchange="updatePath(['editing','subtitles'],this.checked)"><div class="toggle-track"></div></label>
+      </div>
+      <div class="form-group" style="margin-top:10px"><label class="form-label">Idioma</label>
+        <select class="input" onchange="updatePath(['editing','language'],this.value)">
+          <option value="pt" ${subLang === 'pt' ? 'selected' : ''}>Português (pt)</option>
+          <option value="en" ${subLang === 'en' ? 'selected' : ''}>English (en)</option>
+          <option value="es" ${subLang === 'es' ? 'selected' : ''}>Español (es)</option>
+        </select>
+      </div>
+      <div class="slider-row" style="margin-top:12px">
+        <div class="slider-header"><span class="slider-label">Tamanho da fonte</span><span class="slider-val" id="v-fs">${subSize}</span></div>
+        <input type="range" min="10" max="40" value="${subSize}" oninput="document.getElementById('v-fs').textContent=this.value;updatePath(['editing','font_size'],+this.value)">
+      </div>
+      <div class="form-group" style="margin-top:12px"><label class="form-label">Cor da legenda</label>
+        <select class="input" onchange="updatePath(['editing','subtitle_color'],this.value)">
+          <option value="yellow" ${subClr === 'yellow' ? 'selected' : ''}>🟡 Amarela</option>
+          <option value="white"  ${subClr === 'white' ? 'selected' : ''}>⚪ Branca</option>
+          <option value="cyan"   ${subClr === 'cyan' ? 'selected' : ''}>🔵 Ciano</option>
+        </select>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">System</span></div>
+      <div class="form-group"><label class="form-label">Pasta de saída (Output)</label>
+        <input class="input" value="${esc(sys.output_folder || 'D:/clips/output')}" oninput="updatePath(['system','output_folder'],this.value)">
+      </div>
+      <div class="form-group" style="margin-top:8px"><label class="form-label">Pasta de clips brutos</label>
+        <input class="input" value="${esc(sys.clips_folder || 'D:/clips/clips')}" oninput="updatePath(['system','clips_folder'],this.value)">
+      </div>
+      <div class="toggle-row" style="margin-top:10px">
+        <div class="toggle-info"><div class="toggle-title">Deletar após upload</div><div class="toggle-desc">Remove o clip após upload bem-sucedido</div></div>
+        <label class="toggle"><input type="checkbox" ${sys.cleanup_after_upload ? 'checked' : ''} onchange="updatePath(['system','cleanup_after_upload'],this.checked)"><div class="toggle-track"></div></label>
+      </div>
+    </div>
+    <div class="card" style="grid-column:1/-1">
+      <div class="card-header"><span class="card-title">Approval Mode</span></div>
+      <div class="toggle-row">
+        <div class="toggle-info">
+          <div class="toggle-title">🎬 Modo Aprovação</div>
+          <div class="toggle-desc">Momentos ficam na fila "Momentos Detectados" para você revisar e gerar clips sob demanda. Desativado = modo automático (gera e posta sem revisão).</div>
+        </div>
+        <label class="toggle"><input type="checkbox" ${sys.approval_mode !== false ? 'checked' : ''} onchange="updatePath(['system','approval_mode'],this.checked);buildMomentsTab()"><div class="toggle-track"></div></label>
+      </div>
+      <div class="slider-row" style="margin-top:14px">
+        <div class="slider-header">
+          <span class="slider-label">Máx. momentos em fila por ciclo</span>
+          <span class="slider-val" id="v-topn">${sys.approval_top_n || 12}</span>
+        </div>
+        <input type="range" min="1" max="50" value="${sys.approval_top_n || 12}"
+               oninput="document.getElementById('v-topn').textContent=this.value;updatePath(['system','approval_top_n'],+this.value)">
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:8px;line-height:1.6">
+        Pesos por tipo de momento são ajustados automaticamente com base no seu feedback (👍/❌/🔥). O sistema aprende quais tipos de momentos você prefere ao longo do tempo.
+      </div>
+    </div>`;
+    }
+
+    function setFormat(f) { updatePath(['editing', 'format'], f); buildProcessingTab(); }
+
+    // ── Config helpers ───────────────────────────────────────────────────────────
+    function updatePath(path, value) {
+      let o = config;
+      for (let i = 0; i < path.length - 1; i++) {
+        if (!o[path[i]]) o[path[i]] = {};
+        o = o[path[i]];
+      }
+      o[path[path.length - 1]] = value;
+    }
+
+    async function saveConfig() {
+      const r = await callApi('save_config', config);
+      toast(r.ok ? '✅ Configuração salva!' : '❌ Erro ao salvar', r.ok ? 'success' : 'error');
+    }
+
+    // ── Toast ────────────────────────────────────────────────────────────────────
+    function toast(msg, type = 'info') {
+      const el = document.createElement('div');
+      el.className = `toast-item ${type}`;
+      el.textContent = msg;
+      document.getElementById('toast').appendChild(el);
+      setTimeout(() => el.remove(), 4000);
+    }
+
+    // ── Momentos Detectados ──────────────────────────────────────────────────────
+
+    // Cache local: moment_id → entry (com final_score)
+    let _moments = {};
+
+    // ── Badge do nav ─────────────────────────────────────────────────────────────
+    function _updateMomentsBadge() {
+      const count = Object.keys(_moments).length;
+      const badge = document.getElementById('momentsBadge');
+      if (!badge) return;
+      if (count > 0) {
+        badge.textContent = count > 99 ? '99+' : count;
+        badge.style.display = 'inline-flex';
+      } else {
+        badge.style.display = 'none';
+      }
+    }
+
+    // ── Chamado pelo Python em tempo real (on_moment_pending) ─────────────────────
+    function onNewMoment(entry) {
+      _moments[entry.moment_id] = entry;
+      _updateMomentsBadge();
+      if (activeTab === 'moments') {
+        _injectOrUpdateCard(entry, true);
+      }
+    }
+
+    // ── Chamado pelo Python quando generate_clip conclui ─────────────────────────
+    function onClipGenerated(result) {
+      const mid = result.moment_id;
+      if (mid) {
+        delete _moments[mid];
+        _updateMomentsBadge();
+        const card = document.getElementById('mc-' + mid);
+        if (card) {
+          card.classList.add('done');
+          setTimeout(() => card.remove(), 800);
+        }
+      }
+      if (result.ok) {
+        toast('🎬 Clip gerado: ' + (result.name || ''), 'success');
+      } else {
+        toast('❌ Falha ao gerar: ' + (result.error || ''), 'error');
+        // Restaura botões do card
+        if (mid) {
+          const btn = document.querySelector(`#mc-${mid} .mc-btn.generate`);
+          if (btn) { btn.disabled = false; btn.innerHTML = '🎬 Gerar'; }
+          const card = document.getElementById('mc-' + mid);
+          if (card) card.classList.remove('generating');
+        }
+      }
+    }
+
+    // ── Carrega lista completa da API (ao entrar na aba) ──────────────────────────
+    async function buildMomentsTab() {
+      const grid = document.getElementById('momentsGrid');
+      const status = document.getElementById('momentsApprovalStatus');
+      grid.innerHTML = '<div class="empty" style="grid-column:1/-1"><div class="spinner" style="margin:0 auto 10px"></div>Carregando…</div>';
+
+      try {
+        const cfg = config?.system || {};
+        const mode = cfg.approval_mode !== false;
+        if (status) status.textContent = mode ? 'modo aprovação ativo ✅' : 'modo automático (approval_mode=false)';
+
+        const list = await callApi('list_moments');
+        _moments = {};
+        list.forEach(m => { _moments[m.moment_id] = m; });
+        _updateMomentsBadge();
+
+        grid.innerHTML = '';
+        if (!list.length) {
+          grid.innerHTML = mode
+            ? '<div class="empty" style="grid-column:1/-1">Nenhum momento pendente.<br><span style="font-size:11px;opacity:.6">Inicie o engine e aguarde detecções.</span></div>'
+            : '<div class="empty" style="grid-column:1/-1">Modo automático ativo — momentos são gerados sem aprovação.<br><span style="font-size:11px;opacity:.6">Ative approval_mode nas configurações para usar esta aba.</span></div>';
+          return;
+        }
+        list.forEach(m => _injectOrUpdateCard(m, false));
+      } catch (e) {
+        grid.innerHTML = '<div class="empty" style="grid-column:1/-1;color:var(--red)">Erro ao carregar momentos.</div>';
+      }
+    }
+
+    // ── Renderiza / atualiza um card ──────────────────────────────────────────────
+    function _injectOrUpdateCard(entry, prepend) {
+      const grid = document.getElementById('momentsGrid');
+      if (!grid) return;
+      const empty = grid.querySelector('.empty');
+      if (empty) empty.remove();
+
+      const mid = entry.moment_id;
+      if (document.getElementById('mc-' + mid)) return;  // já existe
+
+      const duration = ((entry.end_sec || 0) - (entry.start_sec || 0)).toFixed(0);
+      const baseScore = (entry.score || 0);
+      const finalScore = (entry.final_score || baseScore);
+      const scorePct = Math.round(finalScore * 100);
+      const reason = entry.reason || 'audio_spike';
+      const platform = entry.platform || '';
+      const channel = entry.channel || '';
+      const addedAt = entry.added_at ? entry.added_at.substring(11, 16) : now();
+      const startFmt = _fmtSec(entry.start_sec || 0);
+      const endFmt = _fmtSec(entry.end_sec || 0);
+
+      // Cor da barra de score
+      const barColor = finalScore >= 0.7
+        ? 'var(--green)'
+        : finalScore >= 0.4 ? 'var(--amber)' : 'var(--red)';
+
+      const div = document.createElement('div');
+      div.className = 'moment-card';
+      div.id = 'mc-' + mid;
+      div.innerHTML = `
+    <div class="mc-head">
+      <div class="mc-chips">
+        <span class="chip chip-${reason}">${reason.replace('_', ' ')}</span>
+        ${platform ? `<span class="chip" style="background:rgba(255,255,255,.05);color:var(--muted);border:1px solid var(--border)">${platform}</span>` : ''}
+      </div>
+      <span class="mc-time">${addedAt}</span>
+    </div>
+    <div class="mc-body">
+      ${channel ? `<div class="mc-channel">📡 ${esc(channel)}</div>` : ''}
+      <div class="mc-range">${startFmt} → ${endFmt} <span style="color:var(--muted)">(${duration}s)</span></div>
+      <div class="mc-score-wrap">
+        <div class="mc-score-bar"><div class="mc-score-fill" style="width:${scorePct}%;background:${barColor}"></div></div>
+        <span class="mc-score-val">${finalScore.toFixed(2)}</span>
+      </div>
+    </div>
+    <div class="mc-actions">
+      <button class="mc-btn top"      onclick="topMoment('${mid}',this)"    title="Top — aumenta peso deste tipo de momento">🔥</button>
+      <button class="mc-btn approve"  onclick="approveMoment('${mid}',this)"title="Aprovar — leve aumento de peso">✅</button>
+      <button class="mc-btn generate" onclick="generateFromMoment('${mid}',this)">🎬 Gerar</button>
+      <button class="mc-btn reject"   onclick="rejectMoment('${mid}',this)" title="Rejeitar e remover do disco">❌</button>
+    </div>`;
+
+      if (prepend && grid.firstChild) {
+        grid.insertBefore(div, grid.firstChild);
+      } else {
+        grid.appendChild(div);
+      }
+    }
+
+    function _fmtSec(s) {
+      const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+      return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+    }
+
+    // ── Ações do usuário ──────────────────────────────────────────────────────────
+
+    async function generateFromMoment(mid, btn) {
+      const card = document.getElementById('mc-' + mid);
+      if (card) card.classList.add('generating');
+      if (btn) { btn.disabled = true; btn.innerHTML = '<div class="mc-spinner"></div> Gerando…'; }
+      toast('⏳ Gerando clip, aguarde…', 'info');
+      try {
+        const r = await callApi('generate_clip', mid);
+        if (!r.ok) {
+          toast('❌ ' + (r.error || 'Falha'), 'error');
+          if (card) card.classList.remove('generating');
+          if (btn) { btn.disabled = false; btn.innerHTML = '🎬 Gerar'; }
+        }
+        // onClipGenerated() será chamado pelo Python quando concluir
+      } catch (e) {
+        toast('❌ ' + e.message, 'error');
+        if (card) card.classList.remove('generating');
+        if (btn) { btn.disabled = false; btn.innerHTML = '🎬 Gerar'; }
+      }
+    }
+
+    async function rejectMoment(mid, btn) {
+      if (!confirm('Rejeitar e remover este momento do disco?')) return;
+      // Remove imediatamente (optimistic)
+      delete _moments[mid];
+      _updateMomentsBadge();
+      const card = document.getElementById('mc-' + mid);
+      if (card) { card.classList.add('done'); setTimeout(() => card.remove(), 500); }
+      try {
+        await callApi('feedback_clip', mid, 'reject');
+      } catch (e) {
+        toast('❌ Erro ao rejeitar: ' + e.message, 'error');
+      }
+    }
+
+    async function approveMoment(mid, btn) {
+      if (btn) { btn.textContent = '✅ Aprovado'; btn.disabled = true; }
+      try {
+        await callApi('feedback_clip', mid, 'approve');
+        toast('👍 Aprovado — peso atualizado', 'success');
+      } catch (e) {
+        toast('❌ ' + e.message, 'error');
+      }
+    }
+
+    async function topMoment(mid, btn) {
+      if (btn) { btn.textContent = '🔥 Top!'; btn.disabled = true; }
+      try {
+        await callApi('feedback_clip', mid, 'top');
+        toast('🔥 Top! Peso máximo aplicado', 'success');
+      } catch (e) {
+        toast('❌ ' + e.message, 'error');
+      }
+    }
+
+    // Boot log
+    addLog('INFO', '⚡ ClipBot v2.0 UI ready.', now());
+  </script>
+</body>
+
+</html>

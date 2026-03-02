@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ClipBot data (sensitive/local)
+*.pickle
+*.log
+credentials.json
+youtube_credentials.json
+youtube_token.pickle
+config.yaml
+settings.json
+feedback.jsonl
+
+# Raw clips and output (large files)
+raw_*.ts
+*.ts
+
+# Gemini artifacts
+.gemini/
