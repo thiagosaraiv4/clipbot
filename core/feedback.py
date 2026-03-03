@@ -1,16 +1,20 @@
 """
-feedback.py — ClipBot v2.4
-Sistema de pesos aprendidos por feedback de aprovação de momentos.
+feedback.py — ClipBot v2.5
+Sistema de pesos aprendidos por feedback + ranking multi-dimensional.
 
 Arquivos gerados em APPDATA/ClipBot/:
   feedback_weights.json  — pesos atuais por reason (persistente)
   feedback.jsonl         — log imutável de cada feedback recebido
+  channel_history.json   — histórico de sucesso por canal
 
 API:
   load_weights()           → dict[reason, float]
   save_weights(weights)
   score_moment(entry, w)   → float  (base_score * weight, clampado 0..1)
-  apply_feedback(reason, label, base_score, weights) → dict atualizado
+  score_moment_advanced()  → float  (multi-dimensional: dur + recency + chat)
+  apply_feedback(...)      → dict atualizado
+  update_channel_history() — registra clip gerado
+  get_channel_stats()      → dict com stats do canal
 
 Labels reconhecidos:
   "top"     → target 1.0  (peso sobe)
@@ -31,9 +35,10 @@ from typing import Dict, Optional
 
 logger = logging.getLogger("ClipBot.Feedback")
 
-APP_DATA      = Path(os.environ.get("APPDATA", Path.home())) / "ClipBot"
-WEIGHTS_FILE  = APP_DATA / "feedback_weights.json"
-FEEDBACK_LOG  = APP_DATA / "feedback.jsonl"
+APP_DATA         = Path(os.environ.get("APPDATA", Path.home())) / "ClipBot"
+WEIGHTS_FILE     = APP_DATA / "feedback_weights.json"
+FEEDBACK_LOG     = APP_DATA / "feedback.jsonl"
+CHANNEL_HISTORY  = APP_DATA / "channel_history.json"
 
 LR    = 0.05
 W_MIN = 0.5
@@ -101,6 +106,168 @@ def score_moment(entry: dict, weights: Optional[Dict[str, float]] = None) -> flo
     return round(min(1.0, max(0.0, base_score * w)), 4)
 
 
+# ─── Multi-dimensional scoring (v2.5) ────────────────────────────────────────
+
+def _duration_bonus(duration: float) -> float:
+    """
+    Bonifica clips no sweet spot (8-15s).
+    <8s ou >20s = penalidade, >30s = penalidade maior.
+    """
+    if 8.0 <= duration <= 15.0:
+        return 1.0
+    elif duration < 8.0 or duration <= 20.0:
+        return 0.9
+    elif duration <= 30.0:
+        return 0.8
+    else:
+        return 0.7
+
+
+def _recency_penalty(seconds_since_last_clip: Optional[float]) -> float:
+    """
+    Penaliza clips muito próximos do anterior.
+    >60s = sem penalidade, <30s = penalidade forte.
+    """
+    if seconds_since_last_clip is None:
+        return 1.0
+    if seconds_since_last_clip >= 60.0:
+        return 1.0
+    elif seconds_since_last_clip >= 30.0:
+        # Interpolação linear 0.75 → 1.0
+        t = (seconds_since_last_clip - 30.0) / 30.0
+        return 0.75 + 0.25 * t
+    else:
+        return 0.5
+
+
+def _chat_boost(chat_rate_ratio: Optional[float]) -> float:
+    """
+    Boost quando chat sobe muito (ratio = msgs_agora / msgs_baseline).
+    >2x = boost de 1.2, >3x = 1.3, else 1.0.
+    """
+    if chat_rate_ratio is None:
+        return 1.0
+    if chat_rate_ratio >= 3.0:
+        return 1.3
+    elif chat_rate_ratio >= 2.0:
+        return 1.2
+    elif chat_rate_ratio >= 1.5:
+        return 1.1
+    return 1.0
+
+
+def score_moment_advanced(
+    entry: dict,
+    weights: Optional[Dict[str, float]] = None,
+    duration: Optional[float] = None,
+    seconds_since_last_clip: Optional[float] = None,
+    chat_rate_ratio: Optional[float] = None,
+    channel: Optional[str] = None,
+) -> float:
+    """
+    Score composto multi-dimensional:
+      final = base × weight × dur_bonus × recency × chat × channel_bonus
+    Clampado em [0, 1].
+    """
+    base = score_moment(entry, weights)
+
+    dur_bonus  = _duration_bonus(duration) if duration else 1.0
+    recency    = _recency_penalty(seconds_since_last_clip)
+    chat       = _chat_boost(chat_rate_ratio)
+
+    # Channel bonus: reasons que historicamente performam bem
+    ch_bonus = 1.0
+    if channel:
+        stats = get_channel_stats(channel)
+        reason = entry.get("reason", "")
+        best = stats.get("best_reasons", [])
+        if reason in best[:2]:
+            ch_bonus = 1.1
+
+    final = base * dur_bonus * recency * chat * ch_bonus
+    final = round(min(1.0, max(0.0, final)), 4)
+
+    logger.debug(
+        f"🧠 Score avançado: base={base:.3f} × dur={dur_bonus:.2f} "
+        f"× rec={recency:.2f} × chat={chat:.2f} × ch={ch_bonus:.2f} "
+        f"= {final:.4f}"
+    )
+    return final
+
+
+# ─── Channel History ──────────────────────────────────────────────────────────
+
+def _load_channel_history() -> dict:
+    """Carrega histórico de canais do disco."""
+    if not CHANNEL_HISTORY.exists():
+        return {}
+    try:
+        return json.loads(CHANNEL_HISTORY.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_channel_history(history: dict) -> None:
+    """Salva histórico de canais no disco."""
+    try:
+        APP_DATA.mkdir(parents=True, exist_ok=True)
+        CHANNEL_HISTORY.write_text(
+            json.dumps(history, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as ex:
+        logger.debug(f"channel_history save falhou: {ex}")
+
+
+def update_channel_history(channel: str, reason: str, score: float) -> None:
+    """Registra um clip gerado no histórico do canal."""
+    history = _load_channel_history()
+
+    if channel not in history:
+        history[channel] = {
+            "total_clips": 0,
+            "total_score": 0.0,
+            "reason_counts": {},
+            "last_clip_ts": None,
+        }
+
+    ch = history[channel]
+    ch["total_clips"] += 1
+    ch["total_score"]  = round(ch.get("total_score", 0.0) + score, 4)
+
+    # Conta reasons
+    rc = ch.get("reason_counts", {})
+    rc[reason] = rc.get(reason, 0) + 1
+    ch["reason_counts"] = rc
+
+    ch["last_clip_ts"] = datetime.now().isoformat()
+
+    # Calcula best_reasons (top 3 por contagem)
+    sorted_reasons = sorted(rc.items(), key=lambda x: x[1], reverse=True)
+    ch["best_reasons"] = [r for r, _ in sorted_reasons[:3]]
+    ch["avg_score"] = round(ch["total_score"] / max(ch["total_clips"], 1), 4)
+
+    history[channel] = ch
+    _save_channel_history(history)
+
+    logger.debug(
+        f"📊 Channel history [{channel}]: "
+        f"clips={ch['total_clips']} avg={ch['avg_score']:.3f} "
+        f"best={ch['best_reasons']}"
+    )
+
+
+def get_channel_stats(channel: str) -> dict:
+    """Retorna stats de um canal (vazio se nunca usado)."""
+    history = _load_channel_history()
+    return history.get(channel, {
+        "total_clips": 0,
+        "avg_score": 0.0,
+        "best_reasons": [],
+        "last_clip_ts": None,
+    })
+
+
 # ─── Apply feedback ───────────────────────────────────────────────────────────
 
 def apply_feedback(
@@ -148,3 +315,4 @@ def apply_feedback(
         f"w: {w:.3f} → {w_new:.3f}  (target={target}, base={base_score:.2f})"
     )
     return weights
+

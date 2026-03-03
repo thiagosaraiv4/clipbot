@@ -80,6 +80,7 @@ class BotEngine:
         # Definidos em _run_bot; usados por generate_clip_from_moment
         self._config:     dict = None
         self._editor            = None
+        self._title_gen         = None
         self._output_dir: Path = None
         self._clips_dir:  Path = None
 
@@ -189,19 +190,21 @@ class BotEngine:
                     "outline_color": "black",
                     "outline_width": 2,
                     "position":      "bottom",
+                    "margin_v":      None,
                 },
+                "layout_preset": "tiktok",
                 "watermark": {"enabled": False, "image_path": "", "position": "top-right", "opacity": 0.7},
                 "intro":     {"enabled": False, "video_path": "", "duration": 3},
                 "outro":     {"enabled": False, "video_path": "", "duration": 3},
                 "title_banner": {
                     "enabled":    True,
-                    "font_path":  "C:\\Windows\\Fonts\\impact.ttf",
                     "bg_color":   "0xCC0000",
                     "text_color": "white",
                     "bg_opacity": 0.92,
                     "border_w":   18,
                     "max_chars":  50,
                     "banner_duration": 5,
+                    "use_whisper_title": True,
                 },
             },
             "upload": {
@@ -339,6 +342,7 @@ class BotEngine:
         from video_editor          import VideoEditor
         from uploader              import MultiPlatformUploader, Notifier
         from description_generator import DescriptionGenerator
+        from title_generator       import TitleGenerator
 
         clips_dir  = Path(config["system"]["clips_folder"])
         output_dir = Path(config["system"]["output_folder"])
@@ -353,12 +357,14 @@ class BotEngine:
 
         editor   = VideoEditor(config, str(output_dir))
         uploader = MultiPlatformUploader(config)
-        desc_gen = DescriptionGenerator(config)
+        desc_gen  = DescriptionGenerator(config)
+        title_gen = TitleGenerator(config)
         Notifier(config)   # side-effect: instancia notificadores
 
         # Expõe para generate_clip_from_moment (thread externa)
         self._config     = config
         self._editor     = editor
+        self._title_gen  = title_gen
         self._output_dir = output_dir
         self._clips_dir  = clips_dir
 
@@ -385,7 +391,7 @@ class BotEngine:
         for plat, channel in active:
             t = threading.Thread(
                 target=self._monitor_platform,
-                args=(plat, channel, clips_dir, editor, uploader, desc_gen),
+                args=(plat, channel, clips_dir, editor, uploader, desc_gen, title_gen),
                 kwargs={"config": config},
                 daemon=True,
             )
@@ -440,7 +446,7 @@ class BotEngine:
 
     def _monitor_platform(self, platform: str, channel: str,
                            clips_dir: Path, editor, uploader, desc_gen,
-                           config: dict = None) -> None:
+                           title_gen=None, config: dict = None) -> None:
         """Monitora UM canal em sua própria thread. try/finally garante cleanup."""
         from stream_capture  import StreamCapture
         from moment_detector import MomentDetector
@@ -545,18 +551,17 @@ class BotEngine:
 
                         capture.extract_segment(raw_file, start, end, raw_clip)
 
-                        # Título automático para o banner (baseado no reason)
-                        _REASON_TITLES = {
-                            "audio_spike":   "REAÇÃO INSANA NA LIVE!",
-                            "chat_flood":    "O CHAT EXPLODIU!",
-                            "keyword":       "O CHAT PEDIU CLIP!",
-                            "super_moment":  "MOMENTO ÉPICO!",
-                            "manual":        "MELHOR MOMENTO DA LIVE!",
-                            "crash":         "BATIDA INSANA!",
-                            "near_miss":     "POR MUITO POUCO!",
-                            "fastest_lap":   "VOLTA MAIS RÁPIDA!",
+                        # Título context-aware via TitleGenerator
+                        moment_entry = {
+                            "reason":   m.reason,
+                            "keywords": m.keywords,
+                            "score":    m.score,
+                            "extra":    m.extra,
                         }
-                        auto_title = _REASON_TITLES.get(m.reason, "CLIP ÉPICO DA LIVE!")
+                        if title_gen:
+                            auto_title = title_gen.generate(raw_clip, moment_entry)
+                        else:
+                            auto_title = "CLIP ÉPICO DA LIVE!"
 
                         edited = editor.process(raw_clip, name, title_text=auto_title)
                         raw_clip.unlink(missing_ok=True)
@@ -675,9 +680,14 @@ class BotEngine:
         # Marca como "processing" para impedir reject concorrente de deletar o raw_file
         self.pending_store.set_processing(moment_id)
         try:
-            from feedback import load_weights, score_moment
+            from feedback import load_weights, score_moment_advanced, update_channel_history
             weights     = load_weights()
-            final_score = score_moment(entry, weights)
+            duration    = entry.get("end_sec", 0) - entry.get("start_sec", 0)
+            final_score = score_moment_advanced(
+                entry, weights,
+                duration=duration,
+                channel=entry.get("channel"),
+            )
 
             ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
             name        = (
@@ -692,14 +702,16 @@ class BotEngine:
 
             # Título para o banner: custom (da UI) ou automático por reason
             if not title_text:
-                _REASON_TITLES = {
-                    "audio_spike":   "REAÇÃO INSANA NA LIVE!",
-                    "chat_flood":    "O CHAT EXPLODIU!",
-                    "keyword":       "O CHAT PEDIU CLIP!",
-                    "super_moment":  "MOMENTO ÉPICO!",
-                    "manual":        "MELHOR MOMENTO DA LIVE!",
+                moment_entry = {
+                    "reason":   entry["reason"],
+                    "keywords": entry.get("keywords", []),
+                    "score":    entry.get("score", 1.0),
+                    "extra":    entry.get("extra", {}),
                 }
-                title_text = _REASON_TITLES.get(entry["reason"], "CLIP ÉPICO DA LIVE!")
+                if self._title_gen:
+                    title_text = self._title_gen.generate(raw_clip, moment_entry)
+                else:
+                    title_text = "CLIP ÉPICO DA LIVE!"
 
             edited = editor.process(raw_clip, name, title_text=title_text)
 
@@ -726,6 +738,16 @@ class BotEngine:
             with self._stats_lock:
                 self.clips_today += 1
                 self.clips_total += 1
+
+            # Registra no histórico do canal
+            try:
+                update_channel_history(
+                    entry.get("channel", "unknown"),
+                    entry["reason"],
+                    final_score,
+                )
+            except Exception:
+                pass
 
             info = {
                 "name":      name,

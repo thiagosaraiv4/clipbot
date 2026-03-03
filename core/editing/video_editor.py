@@ -229,18 +229,27 @@ class VideoEditor:
             filters.append(f"scale={w}:{h}")
             use_complex = False
 
-        # ── Legendas ────────────────────────────────────────────────────────
+        # ── Legendas (com safe area dinâmica) ─────────────────────────────
         sub_filter = ""
         if srt_path and cfg["subtitles"]["enabled"]:
             font      = cfg["subtitles"]["font"]
             font_size = cfg["subtitles"]["font_size"]
             outline_w = cfg["subtitles"]["outline_width"]
             srt_esc   = str(srt_path).replace("\\", "/").replace(":", "\\:")
+
+            # MarginV dinâmico por preset de plataforma
+            layout    = cfg.get("layout_preset", "tiktok")
+            margin_v  = cfg["subtitles"].get("margin_v", None)
+            if margin_v is None:
+                _preset_margins = {"tiktok": 80, "shorts": 60, "reels": 70}
+                margin_v = _preset_margins.get(layout, 80)
+
             sub_filter = (
                 f"subtitles='{srt_esc}':"
                 f"force_style='FontName={font},FontSize={font_size},"
                 f"PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,"
-                f"Outline={outline_w},Bold=1,Alignment=2'"
+                f"Outline={outline_w},Bold=1,Alignment=2,"
+                f"MarginV={margin_v}'"
             )
 
         # ── Title banner (drawtext) ──────────────────────────────────────────
