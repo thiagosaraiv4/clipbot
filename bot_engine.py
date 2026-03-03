@@ -191,6 +191,7 @@ class BotEngine:
                     "outline_width": 2,
                     "position":      "bottom",
                     "margin_v":      None,
+                    "safe_margin_right": 60,
                 },
                 "layout_preset": "tiktok",
                 "watermark": {"enabled": False, "image_path": "", "position": "top-right", "opacity": 0.7},
@@ -460,6 +461,7 @@ class BotEngine:
         label    = f"{platform.upper()}:{clean}"
         capture  = StreamCapture(cfg, str(clips_dir))
         processed: set = set()
+        last_clip_time: float = 0.0   # timestamp do último clip gerado
 
         try:
             raw_file = capture.start_recording(platform)
@@ -537,6 +539,23 @@ class BotEngine:
                         f"{m.start_sec:.1f}s → {m.end_sec:.1f}s  score={m.score:.2f}"
                     )
 
+                    # Score avançado com recency e chat
+                    from feedback import score_moment_advanced
+                    secs_since = (time.time() - last_clip_time) if last_clip_time > 0 else None
+                    chat_ratio = None
+                    if hasattr(detector, 'chat') and detector.chat and hasattr(detector.chat, 'chat_rate_ratio'):
+                        chat_ratio = detector.chat.chat_rate_ratio
+                    adv_score = score_moment_advanced(
+                        {"reason": m.reason, "score": m.score},
+                        duration=m.end_sec - m.start_sec,
+                        seconds_since_last_clip=secs_since,
+                        chat_rate_ratio=chat_ratio,
+                        channel=channel,
+                    )
+                    if adv_score < 0.15:
+                        logger.info(f"⏭️ [{label}] Score avançado muito baixo ({adv_score:.3f}), pulando")
+                        continue
+
                     try:
                         ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
                         name     = f"clip_{platform}_{clean}_{ts}_{m.reason}"
@@ -565,6 +584,7 @@ class BotEngine:
 
                         edited = editor.process(raw_clip, name, title_text=auto_title)
                         raw_clip.unlink(missing_ok=True)
+                        last_clip_time = time.time()
 
                         logger.info("✨ Gerando descrições com IA...")
                         all_results = {}

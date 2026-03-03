@@ -338,6 +338,25 @@ class TwitchChatDetector:
         self._msg_times: deque = deque()
         self._kw_times:  deque = deque()
         self._running    = False
+        self._baseline_rate: float = 0.0   # média histórica de msgs/s
+        self._rate_samples: deque = deque(maxlen=60)  # últimas 60 amostras de rate
+
+    @property
+    def chat_rate(self) -> float:
+        """Taxa atual de mensagens por segundo."""
+        if not self._msg_times:
+            return 0.0
+        win = self.cfg_flood["window_seconds"]
+        now = time.time()
+        count = sum(1 for t in self._msg_times if now - t <= win)
+        return count / win
+
+    @property
+    def chat_rate_ratio(self) -> float:
+        """Ratio da taxa atual vs baseline (>2 = chat 2x mais ativo que o normal)."""
+        if self._baseline_rate <= 0.01:
+            return 1.0
+        return self.chat_rate / self._baseline_rate
 
     def get_moments_snapshot(self) -> List[Moment]:
         with self._lock:
@@ -434,6 +453,11 @@ class TwitchChatDetector:
         while self._msg_times and now - self._msg_times[0] > win_f:
             self._msg_times.popleft()
         rate = len(self._msg_times) / win_f
+
+        # Atualiza baseline para chat_rate_ratio
+        self._rate_samples.append(rate)
+        if len(self._rate_samples) >= 5:
+            self._baseline_rate = sum(self._rate_samples) / len(self._rate_samples)
         if rate >= self.cfg_flood["messages_per_second"]:
             self._add_moment("chat_flood", csec,
                              self.cfg_flood["buffer_before"],
