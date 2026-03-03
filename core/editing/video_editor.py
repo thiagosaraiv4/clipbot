@@ -7,6 +7,7 @@ watermark, intro/outro e exporta em formato final.
 import logging
 import subprocess
 import tempfile
+import textwrap
 from pathlib import Path
 from typing import Optional
 
@@ -57,10 +58,141 @@ class VideoEditor:
         return f"{h:02d}:{m:02d}:{sc:02d},{ms:03d}"
 
     # ------------------------------------------------------------------
+    # Title Banner helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _wrap_title(text: str, max_chars: int = 50, max_lines: int = 1) -> str:
+        """Limpa e trunca título. max_lines=1 pois drawtext não suporta \\n."""
+        text = " ".join(text.strip().upper().split())  # remove espaços duplos
+        if len(text) <= max_chars:
+            return text
+        words = text.split()
+        lines, cur = [], ""
+        for w in words:
+            nxt = (cur + " " + w).strip()
+            if cur and len(nxt) > max_chars:
+                lines.append(cur.strip())
+                cur = w
+                if len(lines) >= max_lines:
+                    break
+            else:
+                cur = nxt
+        if cur and len(lines) < max_lines:
+            lines.append(cur.strip())
+        # Trunca última linha se ainda for longa
+        if lines and len(lines[-1]) > max_chars:
+            lines[-1] = lines[-1][:max_chars - 1].rstrip() + "…"
+        return "\\n".join(lines) if lines else text[:max_chars - 1].rstrip() + "…"
+
+    @staticmethod
+    def _escape_drawtext(text: str) -> str:
+        """Escapa caracteres especiais para o filtro drawtext do FFmpeg."""
+        # Ordem importa: \ primeiro
+        text = text.replace("\\", "\\\\")
+        text = text.replace(":", "\\:")
+        text = text.replace("'", "\\'")
+        text = text.replace("%", "\\%")
+        text = text.replace("\n", "\\n")
+        return text
+
+    @staticmethod
+    def _ffmpeg_fontfile(font_path: str) -> str:
+        """
+        Converte path de fonte para formato FFmpeg.
+        Windows: C:\\Windows\\Fonts\\arial.ttf → C\\:/Windows/Fonts/arial.ttf
+        """
+        # Troca backslash por forward slash
+        fp = font_path.replace("\\", "/")
+        # Escapa o ':' do drive letter (ex: C: → C\:)
+        if len(fp) >= 2 and fp[1] == ":":
+            fp = fp[0] + "\\:" + fp[2:]
+        return fp
+
+    def _build_title_filter(self, title_text: str) -> str:
+        """Constrói filtro estilo clip (faixa full-width + texto bold grande com sombra)."""
+        tb_cfg = self.cfg.get("title_banner", {})
+        max_chars = tb_cfg.get("max_chars", 14)
+        wrapped = self._wrap_title(title_text, max_chars=max_chars)
+        escaped = self._escape_drawtext(wrapped)
+
+        # ── Auto-fit fontsize baseado no comprimento do texto ─────────
+        # Impact font em 1080px: cada char ocupa ~fontsize*0.55
+        text_len = len(wrapped)
+        if text_len > 30:
+            fontsize = "h/30"
+        elif text_len > 25:
+            fontsize = "h/26"
+        elif text_len > 20:
+            fontsize = "h/24"
+        elif text_len > 15:
+            fontsize = "h/20"
+        else:
+            fontsize = "h/16"
+
+        # ── Resolução de fonte (cadeia de fallback) ────────────────────
+        # tb_cfg já lido acima
+        cfg_font = tb_cfg.get("font_path", "")
+
+        font_candidates = [
+            cfg_font,
+            "C:\\Windows\\Fonts\\impact.ttf",
+            "C:\\Windows\\Fonts\\arialbd.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+        ]
+        resolved_font = None
+        for fp in font_candidates:
+            if fp and Path(fp).exists():
+                resolved_font = fp
+                break
+
+        if resolved_font:
+            font_arg = f"fontfile='{self._ffmpeg_fontfile(resolved_font)}'"
+        else:
+            font_arg = "font='Arial'"
+
+        # ── Cores e dimensões configuráveis ────────────────────────────
+        bg_color   = tb_cfg.get("bg_color", "0xCC0000")
+        text_color = tb_cfg.get("text_color", "white")
+        bg_opacity = tb_cfg.get("bg_opacity", 0.92)
+        banner_dur = tb_cfg.get("banner_duration", 5)
+
+        # Sanitiza '#RRGGBB' → '0xRRGGBB' (# é comentário no FFmpeg)
+        if bg_color.startswith("#"):
+            bg_color = "0x" + bg_color[1:]
+
+        # drawbox: h/w são auto-referência do box; usar ih/iw para input
+        # drawtext: h/w referem ao input, então OK
+        strip_h_db = "ih/8"       # drawbox: altura da faixa
+        y_pos_db   = "ih*0.40"    # drawbox: posição Y
+        strip_h_dt = "h/8"        # drawtext: mesma proporção
+        y_pos_dt   = "h*0.40"     # drawtext: mesma posição
+
+        # Margem de segurança: clamp x para nunca vazar nas bordas
+        x_expr = "min(max(40\\,(w-text_w)/2)\\,w-text_w-40)"
+
+        # 1) drawbox: faixa colorida cobrindo 100% da largura (5s)
+        # 2) drawtext: texto grande centralizado na faixa, com sombra (5s)
+        return (
+            f"drawbox=x=0:y={y_pos_db}:w=iw:h={strip_h_db}"
+            f":color={bg_color}@{bg_opacity}:t=fill"
+            f":enable='lt(t\\,{banner_dur})',"
+            f"drawtext={font_arg}"
+            f":text='{escaped}'"
+            f":fontsize={fontsize}"
+            f":fontcolor={text_color}"
+            f":shadowcolor=black@0.75:shadowx=4:shadowy=4"
+            f":x={x_expr}"
+            f":y={y_pos_dt}+({strip_h_dt}-text_h)/2"
+            f":enable='lt(t\\,{banner_dur})'"
+        )
+
+    # ------------------------------------------------------------------
     # Filtro ffmpeg
     # ------------------------------------------------------------------
 
-    def _build_ffmpeg_filter(self, srt_path: Optional[Path] = None) -> str:
+    def _build_ffmpeg_filter(self, srt_path: Optional[Path] = None,
+                             title_text: Optional[str] = None) -> str:
         """
         Constrói filtergraph ffmpeg.
         Modo vertical: vídeo inteiro em 9:16 com fundo desfocado (sem corte).
@@ -111,18 +243,26 @@ class VideoEditor:
                 f"Outline={outline_w},Bold=1,Alignment=2'"
             )
 
+        # ── Title banner (drawtext) ──────────────────────────────────────────
+        title_filter = ""
+        tb_enabled = self.cfg.get("title_banner", {}).get("enabled", True)
+        if title_text and title_text.strip() and tb_enabled:
+            title_filter = self._build_title_filter(title_text)
+
         return {
             "use_complex": use_complex,
             "complex_steps": filters if use_complex else [],
             "simple_vf": filters[0] if not use_complex else "",
             "sub_filter": sub_filter,
+            "title_filter": title_filter,
         }
 
     # ------------------------------------------------------------------
     # Processo principal de edição
     # ------------------------------------------------------------------
 
-    def process(self, input_path: Path, output_name: str) -> Path:
+    def process(self, input_path: Path, output_name: str,
+                title_text: Optional[str] = None) -> Path:
         """Processa um clip bruto e retorna o arquivo final editado."""
         output_path = self.out_dir / f"{output_name}.mp4"
         logger.info(f"✂️  Editando: {input_path.name} → {output_path.name}")
@@ -170,15 +310,27 @@ class VideoEditor:
                     self._segments_to_srt(segments, srt_path)
 
             # --- Monta filtro ---
-            flt = self._build_ffmpeg_filter(srt_path)
+            flt = self._build_ffmpeg_filter(srt_path, title_text=title_text)
             cmd = ["ffmpeg", "-y", "-i", str(current)]
 
             if flt["use_complex"]:
                 # Modo vertical: fundo blur + vídeo sobreposto
                 steps = flt["complex_steps"].copy()   # split, bg, fg, overlay
 
-                if flt["sub_filter"]:
-                    # Adiciona legendas sobre o resultado final
+                # Pipeline: overlay → title_banner → subtitles
+                # O último step atual termina com [vout]
+
+                if flt["title_filter"] and flt["sub_filter"]:
+                    # Título + legendas: overlay→[pre_title]→title→[pre_sub]→subs→[vout]
+                    steps[-1] = steps[-1].replace("[vout]", "[pre_title]")
+                    steps.append(f"[pre_title]{flt['title_filter']}[pre_sub]")
+                    steps.append(f"[pre_sub]{flt['sub_filter']}[vout]")
+                elif flt["title_filter"]:
+                    # Só título: overlay→[pre_title]→title→[vout]
+                    steps[-1] = steps[-1].replace("[vout]", "[pre_title]")
+                    steps.append(f"[pre_title]{flt['title_filter']}[vout]")
+                elif flt["sub_filter"]:
+                    # Só legendas (comportamento original)
                     steps[-1] = steps[-1].replace("[vout]", "[pre_sub]")
                     steps.append(f"[pre_sub]{flt['sub_filter']}[vout]")
 
@@ -186,9 +338,14 @@ class VideoEditor:
                 cmd += ["-filter_complex", filter_complex, "-map", "[vout]", "-map", "0:a?"]
             else:
                 # Modo horizontal simples
-                vf = flt["simple_vf"]
+                vf_parts = []
+                if flt["simple_vf"]:
+                    vf_parts.append(flt["simple_vf"])
+                if flt["title_filter"]:
+                    vf_parts.append(flt["title_filter"])
                 if flt["sub_filter"]:
-                    vf = vf + "," + flt["sub_filter"] if vf else flt["sub_filter"]
+                    vf_parts.append(flt["sub_filter"])
+                vf = ",".join(vf_parts)
                 cmd += ["-vf", vf]
 
             cmd += [

@@ -2138,6 +2138,10 @@
         <span class="mc-score-val">${finalScore.toFixed(2)}</span>
       </div>
     </div>
+    <div class="mc-title-input">
+      <input id="title-${mid}" type="text" placeholder="Título do banner (opcional)…"
+             style="width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:0.82rem;outline:none;">
+    </div>
     <div class="mc-actions">
       <button class="mc-btn top"      onclick="topMoment('${mid}',this)"    title="Top — aumenta peso deste tipo de momento">🔥</button>
       <button class="mc-btn approve"  onclick="approveMoment('${mid}',this)"title="Aprovar — leve aumento de peso">✅</button>
@@ -2163,9 +2167,14 @@
       const card = document.getElementById('mc-' + mid);
       if (card) card.classList.add('generating');
       if (btn) { btn.disabled = true; btn.innerHTML = '<div class="mc-spinner"></div> Gerando…'; }
+
+      // Lê título custom do input (se preenchido)
+      const titleInput = document.getElementById('title-' + mid);
+      const titleText = titleInput ? titleInput.value.trim() : null;
+
       toast('⏳ Gerando clip, aguarde…', 'info');
       try {
-        const r = await callApi('generate_clip', mid);
+        const r = await callApi('generate_clip', mid, titleText || null);
         if (!r.ok) {
           toast('❌ ' + (r.error || 'Falha'), 'error');
           if (card) card.classList.remove('generating');

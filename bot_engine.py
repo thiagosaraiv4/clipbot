@@ -193,6 +193,16 @@ class BotEngine:
                 "watermark": {"enabled": False, "image_path": "", "position": "top-right", "opacity": 0.7},
                 "intro":     {"enabled": False, "video_path": "", "duration": 3},
                 "outro":     {"enabled": False, "video_path": "", "duration": 3},
+                "title_banner": {
+                    "enabled":    True,
+                    "font_path":  "C:\\Windows\\Fonts\\impact.ttf",
+                    "bg_color":   "0xCC0000",
+                    "text_color": "white",
+                    "bg_opacity": 0.92,
+                    "border_w":   18,
+                    "max_chars":  50,
+                    "banner_duration": 5,
+                },
             },
             "upload": {
                 "delay_between_posts": upl["delay_sec"],
@@ -534,7 +544,21 @@ class BotEngine:
                             end   = end + pad
 
                         capture.extract_segment(raw_file, start, end, raw_clip)
-                        edited = editor.process(raw_clip, name)
+
+                        # Título automático para o banner (baseado no reason)
+                        _REASON_TITLES = {
+                            "audio_spike":   "REAÇÃO INSANA NA LIVE!",
+                            "chat_flood":    "O CHAT EXPLODIU!",
+                            "keyword":       "O CHAT PEDIU CLIP!",
+                            "super_moment":  "MOMENTO ÉPICO!",
+                            "manual":        "MELHOR MOMENTO DA LIVE!",
+                            "crash":         "BATIDA INSANA!",
+                            "near_miss":     "POR MUITO POUCO!",
+                            "fastest_lap":   "VOLTA MAIS RÁPIDA!",
+                        }
+                        auto_title = _REASON_TITLES.get(m.reason, "CLIP ÉPICO DA LIVE!")
+
+                        edited = editor.process(raw_clip, name, title_text=auto_title)
                         raw_clip.unlink(missing_ok=True)
 
                         logger.info("✨ Gerando descrições com IA...")
@@ -622,7 +646,8 @@ class BotEngine:
     # Geração de clip a partir de momento pendente (chamado pela API)
     # ──────────────────────────────────────────────────────────────────────────
 
-    def generate_clip_from_moment(self, moment_id: str) -> dict:
+    def generate_clip_from_moment(self, moment_id: str,
+                                   title_text: str = None) -> dict:
         """
         Processa um momento da PendingStore:
           1. Busca o raw_clip pré-extraído
@@ -664,7 +689,19 @@ class BotEngine:
             output_dir.mkdir(parents=True, exist_ok=True)
 
             logger.info(f"🎬 Gerando clip do momento {moment_id[:8]} [{entry['reason']}]…")
-            edited = editor.process(raw_clip, name)
+
+            # Título para o banner: custom (da UI) ou automático por reason
+            if not title_text:
+                _REASON_TITLES = {
+                    "audio_spike":   "REAÇÃO INSANA NA LIVE!",
+                    "chat_flood":    "O CHAT EXPLODIU!",
+                    "keyword":       "O CHAT PEDIU CLIP!",
+                    "super_moment":  "MOMENTO ÉPICO!",
+                    "manual":        "MELHOR MOMENTO DA LIVE!",
+                }
+                title_text = _REASON_TITLES.get(entry["reason"], "CLIP ÉPICO DA LIVE!")
+
+            edited = editor.process(raw_clip, name, title_text=title_text)
 
             # ── Sidecar JSON ──────────────────────────────────────────────────
             sidecar = edited.with_suffix(".json")

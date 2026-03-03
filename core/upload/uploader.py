@@ -243,9 +243,10 @@ class TikTokUploader:
         dismiss_modals()
         time.sleep(1)
 
-        # ── Post ──────────────────────────────────────────────────────────────
+    # ── Post ──────────────────────────────────────────────────────────────
         logger.info("📤 TikTok: clicando em Post...")
         posted = False
+
         try:
             for sel in [
                 "button[data-e2e='post-btn']",
@@ -254,52 +255,92 @@ class TikTokUploader:
             ]:
                 try:
                     btn = page.locator(sel).last
-                    if btn.is_visible(timeout=2000):
+                    if btn.is_visible(timeout=3000):
+                        # Primeiro: scroll_into_view (preferível)
+                        try:
+                            btn.scroll_into_view_if_needed()
+                            time.sleep(0.5)
+                        except Exception:
+                            # Fallback: scroll global
+                            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            time.sleep(1)
                         btn.click(force=True)
                         posted = True
+                        logger.info("✅ TikTok: botão Post clicado")
                         break
                 except Exception:
                     continue
+
             if not posted:
+                # Fallback JS: scroll + click
                 page.evaluate("""
                     const b = document.querySelector('button[data-e2e="post-btn"]')
                            || [...document.querySelectorAll('button')]
                               .find(x => x.textContent.trim() === 'Post');
-                    if (b) b.click();
+                    if (b) { b.scrollIntoView(); b.click(); }
                 """)
                 posted = True
         except Exception as e:
             logger.warning(f"⚠️ TikTok Post click: {e}")
 
-        # ── Confirmação ───────────────────────────────────────────────────────
+        if not posted:
+            logger.error("❌ TikTok: não conseguiu clicar no botão Post.")
+            return False
+
+        # ── Confirmação (URL OU elemento de sucesso) ──────────────────────
         logger.info("📤 TikTok: aguardando confirmação...")
+        confirm_timeout = 60   # segundos
         published = False
+
+        # Estratégia 1: aguardar redirecionamento de URL
         try:
             page.wait_for_url(
-                lambda url: "upload" not in url and "tiktok.com" in url,
-                timeout=45000,
+                lambda url: (
+                    "upload" not in url.lower()
+                    and ("tiktok.com" in url or "tiktokstudio" in url)
+                ),
+                timeout=confirm_timeout * 1000,
             )
             published = True
-            logger.info(f"✅ TikTok: publicado! {page.url}")
+            logger.info(f"✅ TikTok: publicado (URL mudou)! {page.url}")
         except Exception:
-            try:
-                page.wait_for_selector(
-                    "[class*='success'], [class*='posted'], [data-e2e*='success']",
-                    timeout=10000,
-                )
+            pass
+
+        # Estratégia 2: procurar toasts/elementos de sucesso
+        if not published:
+            success_selectors = [
+                ":text('Upload another')",
+                ":text('View post')",
+                ":text('Posted')",
+                ":text('Uploaded')",
+                ":text('Your video is being uploaded')",
+                ":text('Your video is being processed')",
+                "[class*='success']",
+                "[class*='posted']",
+                "[data-e2e*='success']",
+            ]
+            for sel in success_selectors:
+                try:
+                    el = page.locator(sel).first
+                    if el.is_visible(timeout=3000):
+                        published = True
+                        logger.info(f"✅ TikTok: sucesso detectado ('{sel}')")
+                        break
+                except Exception:
+                    continue
+
+        # Estratégia 3: checar se saiu da página de upload
+        if not published:
+            current_url = page.url.lower()
+            if "upload" not in current_url and "tiktok" in current_url:
                 published = True
-                logger.info("✅ TikTok: sucesso detectado na página")
-            except Exception:
-                if "upload" in page.url:
-                    logger.warning("⚠️ TikTok: ainda na página de upload.")
-                    dismiss_modals()
-                    time.sleep(3)
-                    published = posted
+                logger.info(f"✅ TikTok: redirecionou para {page.url}")
 
         if published:
             logger.info("✅ TikTok: upload concluído!")
         else:
-            logger.error("❌ TikTok: publicação não confirmada. Verifique a conta.")
+            logger.error("❌ TikTok: publicação NÃO confirmada. "
+                         "Verifique manualmente se o vídeo foi postado.")
 
         return published
 

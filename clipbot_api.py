@@ -303,7 +303,7 @@ class ClipBotAPI:
             logger.error(f"list_moments: {e}")
             return []
 
-    def generate_clip(self, moment_id: str) -> dict:
+    def generate_clip(self, moment_id: str, title_text: str = None) -> dict:
         """
         Dispara geração do clip em thread daemon.
         Retorna {"ok": True, "started": True} imediatamente.
@@ -313,13 +313,13 @@ class ClipBotAPI:
             return {"ok": False, "error": "Engine não está rodando"}
         threading.Thread(
             target=self._do_generate_clip,
-            args=(moment_id,),
+            args=(moment_id, title_text),
             daemon=True,
         ).start()
         return {"ok": True, "started": True}
 
-    def _do_generate_clip(self, moment_id: str) -> None:
-        result = self._engine.generate_clip_from_moment(moment_id)
+    def _do_generate_clip(self, moment_id: str, title_text: str = None) -> None:
+        result = self._engine.generate_clip_from_moment(moment_id, title_text=title_text)
         payload = {**result, "moment_id": moment_id}
         self._js(f"onClipGenerated({json.dumps(payload)})")
 
