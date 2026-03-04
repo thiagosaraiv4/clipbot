@@ -219,6 +219,18 @@ class BotEngine:
                     ],
                     "action": "skip",
                 },
+                "clip_analysis": {
+                    "enabled": True,
+                    "reaction_weight": 0.5,
+                    "hook_pre_roll": 3.0,
+                    "audio_norm": 0.06,
+                    "motion_norm": 12.0,
+                    "quality_gate": {
+                        "enabled": True,
+                        "min_rms": 0.01,
+                        "min_motion": 5.0,
+                    },
+                },
             },
             "upload": {
                 "delay_between_posts": upl["delay_sec"],
@@ -580,7 +592,53 @@ class BotEngine:
                             start = max(0.0, start - pad)
                             end   = end + pad
 
+                        # ── ClipBot v3: Reaction + Hook + QualityGate ───
+                        ca_cfg = config["editing"].get("clip_analysis", {})
+                        if ca_cfg.get("enabled", False):
+                            from clip_analyzer import compute_reaction_score, find_hook_start, quality_gate
+
+                            # (1) ReactionDetector
+                            reaction = compute_reaction_score(
+                                raw_file, m.start_sec, m.end_sec,
+                                audio_norm=ca_cfg.get("audio_norm", 0.06),
+                                motion_norm=ca_cfg.get("motion_norm", 12.0),
+                            )
+                            rw = ca_cfg.get("reaction_weight", 0.5)
+                            effective_score = adv_score * (1 - rw + rw * reaction)
+                            logger.info(
+                                f"\U0001f3ad [{label}] Reaction: {reaction:.2f}  "
+                                f"base={adv_score:.2f}  effective={effective_score:.2f}"
+                            )
+                            if effective_score < 0.10:
+                                logger.info(f"\u23ed\ufe0f [{label}] Score efetivo baixo ({effective_score:.2f}), pulando")
+                                continue
+
+                            # (2) HookStartFinder
+                            hook_start = find_hook_start(
+                                raw_file, start,
+                                pre_roll=ca_cfg.get("hook_pre_roll", 3.0),
+                                audio_norm=ca_cfg.get("audio_norm", 0.06),
+                                motion_norm=ca_cfg.get("motion_norm", 12.0),
+                            )
+                            if hook_start < start:
+                                logger.info(f"\U0001f3af [{label}] Hook start: {start:.1f}s \u2192 {hook_start:.1f}s")
+                                start = hook_start
+
                         capture.extract_segment(raw_file, start, end, raw_clip)
+
+                        # (3) QualityGate
+                        if ca_cfg.get("enabled", False):
+                            qg = ca_cfg.get("quality_gate", {})
+                            if qg.get("enabled", True):
+                                passed, qg_reason = quality_gate(
+                                    raw_clip,
+                                    min_rms=qg.get("min_rms", 0.01),
+                                    min_motion=qg.get("min_motion", 5.0),
+                                )
+                                if not passed:
+                                    logger.warning(f"\U0001f6ab [{label}] QualityGate: {qg_reason} \u2014 SKIP")
+                                    raw_clip.unlink(missing_ok=True)
+                                    continue
 
                         # Título context-aware via TitleGenerator
                         moment_entry = {
