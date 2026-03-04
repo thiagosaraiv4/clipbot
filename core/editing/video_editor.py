@@ -84,26 +84,60 @@ class VideoEditor:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _detect_commercial_offset(segments: list, max_skip: float = 8.0) -> float:
+    def _detect_commercial_offset(video_path, max_skip: float = 8.0) -> float:
         """
-        Verifica se os primeiros segmentos contêm 'commercial break'.
+        Analisa frames do vídeo para detectar tela de comercial da Twitch
+        (gradiente roxo/azul característico). Usa FFmpeg para extrair cor média.
         Retorna:
-          >0  = segundos para pular (trim do início)
+          >0  = segundos de comercial para trimar
           0   = sem comercial detectado
           -1  = comercial muito longo (>max_skip), clip deve ser SKIP
         """
-        if not segments:
-            return 0.0
-        for seg in segments:
-            if seg.get("end", 0) > 6.0:
+        import subprocess as sp
+
+        check_times = [0.5, 1.5, 3.0, 5.0]
+        commercial_end = 0.0
+
+        for t in check_times:
+            if t > max_skip:
                 break
-            text_lower = seg.get("text", "").lower()
-            if "commercial break" in text_lower or "commercial" in text_lower:
-                end_time = seg.get("end", 0)
-                if end_time > max_skip:
-                    return -1.0  # comercial muito longo → skip
-                return end_time + 0.5  # +0.5s de margem
-        return 0.0
+            try:
+                # Extrair 1x1 pixel (cor média do frame)
+                cmd = [
+                    "ffmpeg", "-ss", str(t), "-i", str(video_path),
+                    "-vframes", "1", "-vf", "scale=1:1",
+                    "-f", "rawvideo", "-pix_fmt", "rgb24",
+                    "pipe:1"
+                ]
+                result = sp.run(cmd, capture_output=True, timeout=10)
+                if result.returncode != 0 or len(result.stdout) < 3:
+                    continue
+
+                r, g, b = result.stdout[0], result.stdout[1], result.stdout[2]
+
+                # Tela de comercial Twitch: roxo/azul dominante
+                # R < 120, B > 140, e azul é o canal mais forte
+                is_commercial = (
+                    r < 120 and b > 140 and
+                    b > r and b >= g and
+                    (b - r) > 40
+                )
+
+                if is_commercial:
+                    commercial_end = t + 1.0  # +1s margem
+                    logger.debug(f"\U0001f4fa Frame t={t:.1f}s: RGB=({r},{g},{b}) → COMERCIAL")
+                else:
+                    # Se este frame NÃO é comercial, parar de procurar
+                    logger.debug(f"\U0001f4fa Frame t={t:.1f}s: RGB=({r},{g},{b}) → conteúdo")
+                    break
+
+            except Exception as e:
+                logger.debug(f"\U0001f4fa Erro ao analisar frame t={t}: {e}")
+                continue
+
+        if commercial_end > max_skip:
+            return -1.0  # comercial muito longo
+        return commercial_end
 
     # ------------------------------------------------------------------
     # Title Banner helpers
@@ -362,36 +396,33 @@ class VideoEditor:
                 ], check=True, capture_output=True)
                 current = outro_out
 
+            # --- Detecção de comercial por análise de frame ---
+            commercial_offset = self._detect_commercial_offset(current)
+            if commercial_offset < 0:
+                logger.warning("\U0001f6ab Comercial muito longo \u2014 clip SKIP")
+                return None
+
+            if commercial_offset > 0:
+                logger.info(f"\U0001f4fa Comercial detectado: trimando {commercial_offset:.1f}s do início")
+                trimmed = tmp / "trimmed.ts"
+                import subprocess as sp_trim
+                sp_trim.run([
+                    "ffmpeg", "-y", "-ss", str(commercial_offset),
+                    "-i", str(current), "-c", "copy", str(trimmed)
+                ], capture_output=True, timeout=30)
+                if trimmed.exists() and trimmed.stat().st_size > 1000:
+                    current = trimmed
+                else:
+                    logger.warning("\u26a0\ufe0f Trim de comercial falhou, usando original")
+
             # --- Transcrição / Legendas ---
             segments = []
-            commercial_offset = 0.0
             if cfg_sub["enabled"]:
                 segments = self._transcribe(current, cfg_sub["language"])
                 if segments:
-                    # Detectar comercial nos primeiros segundos
-                    commercial_offset = self._detect_commercial_offset(segments)
-                    if commercial_offset < 0:
-                        logger.warning("🚫 Comercial muito longo — clip SKIP")
-                        return None
-
-                    if commercial_offset > 0:
-                        logger.info(f"📺 Comercial detectado: trimando {commercial_offset:.1f}s do início")
-                        # Ajustar timestamps dos segmentos
-                        adjusted = []
-                        for seg in segments:
-                            new_start = seg["start"] - commercial_offset
-                            new_end   = seg["end"]   - commercial_offset
-                            if new_end > 0:
-                                adjusted.append({
-                                    **seg,
-                                    "start": max(0, new_start),
-                                    "end":   new_end,
-                                })
-                        segments = adjusted
-
                     # --- Filtro de conteúdo (apostas/propaganda) ---
                     cf = self.cfg.get("content_filter", {})
-                    if cf.get("enabled", False) and segments:
+                    if cf.get("enabled", False):
                         full_text = " ".join(
                             seg.get("text", "") for seg in segments
                         ).lower()
@@ -399,7 +430,7 @@ class VideoEditor:
                         matched = [kw for kw in blacklist if kw.lower() in full_text]
                         if matched and cf.get("action", "skip") == "skip":
                             logger.warning(
-                                f"🚫 Conteúdo filtrado (blacklist): {matched[:3]} — clip SKIP"
+                                f"\U0001f6ab Conteúdo filtrado (blacklist): {matched[:3]} \u2014 clip SKIP"
                             )
                             return None
 
@@ -408,10 +439,7 @@ class VideoEditor:
 
             # --- Monta filtro ---
             flt = self._build_ffmpeg_filter(srt_path, title_text=title_text)
-            cmd = ["ffmpeg", "-y"]
-            if commercial_offset > 0:
-                cmd += ["-ss", str(commercial_offset)]
-            cmd += ["-i", str(current)]
+            cmd = ["ffmpeg", "-y", "-i", str(current)]
 
             if flt["use_complex"]:
                 # Modo vertical: fundo blur + vídeo sobreposto
