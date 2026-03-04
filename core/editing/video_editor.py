@@ -84,60 +84,82 @@ class VideoEditor:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _detect_commercial_offset(video_path, max_skip: float = 8.0) -> float:
+    def _is_commercial_frame(video_path, timestamp: float) -> bool:
         """
-        Analisa frames do vídeo para detectar tela de comercial da Twitch
-        (gradiente roxo/azul característico). Usa FFmpeg para extrair cor média.
-        Retorna:
-          >0  = segundos de comercial para trimar
-          0   = sem comercial detectado
-          -1  = comercial muito longo (>max_skip), clip deve ser SKIP
+        Extrai mini-frame 64x36 em `timestamp` e calcula % de pixels
+        com padrão roxo/azul da Twitch (R<120, B>140, B-R>40).
+        Retorna True se >= 45% dos pixels são comercial.
         """
         import subprocess as sp
+        try:
+            cmd = [
+                "ffmpeg", "-ss", str(timestamp), "-i", str(video_path),
+                "-vframes", "1", "-vf", "scale=64:36",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "pipe:1"
+            ]
+            result = sp.run(cmd, capture_output=True, timeout=10)
+            if result.returncode != 0 or len(result.stdout) < 64 * 36 * 3:
+                return False
 
-        check_times = [0.5, 1.5, 3.0, 5.0]
-        commercial_end = 0.0
+            pixels = result.stdout
+            total = 64 * 36
+            commercial_px = 0
+            for i in range(total):
+                r = pixels[i * 3]
+                g = pixels[i * 3 + 1]
+                b = pixels[i * 3 + 2]
+                if r < 120 and b > 140 and (b - r) > 40:
+                    commercial_px += 1
+
+            pct = commercial_px / total
+            logger.debug(f"\U0001f4fa t={timestamp:.1f}s: {pct:.0%} px comercial")
+            return pct >= 0.45
+
+        except Exception as e:
+            logger.debug(f"\U0001f4fa Erro frame t={timestamp}: {e}")
+            return False
+
+    @classmethod
+    def _detect_commercial_offset(cls, video_path, max_total: float = 14.0) -> float:
+        """
+        Scan robusto: analisa frames nos primeiros 12s para encontrar
+        comerçiais. Determina offset para trim.
+        Retorna:
+          >0  = segundos de comercial para trimar
+          0   = sem comercial
+          -1  = comercial muito longo (>max_total), SKIP
+        """
+        check_times = [0.5, 2.5, 4.5, 6.5, 8.5, 10.5]
+        commercial_flags = []
 
         for t in check_times:
-            if t > max_skip:
-                break
-            try:
-                # Extrair 1x1 pixel (cor média do frame)
-                cmd = [
-                    "ffmpeg", "-ss", str(t), "-i", str(video_path),
-                    "-vframes", "1", "-vf", "scale=1:1",
-                    "-f", "rawvideo", "-pix_fmt", "rgb24",
-                    "pipe:1"
-                ]
-                result = sp.run(cmd, capture_output=True, timeout=10)
-                if result.returncode != 0 or len(result.stdout) < 3:
-                    continue
+            is_comm = cls._is_commercial_frame(video_path, t)
+            commercial_flags.append((t, is_comm))
 
-                r, g, b = result.stdout[0], result.stdout[1], result.stdout[2]
+        # Contar quantos são comercial
+        comm_count = sum(1 for _, f in commercial_flags if f)
 
-                # Tela de comercial Twitch: roxo/azul dominante
-                # R < 120, B > 140, e azul é o canal mais forte
-                is_commercial = (
-                    r < 120 and b > 140 and
-                    b > r and b >= g and
-                    (b - r) > 40
-                )
+        if comm_count == 0:
+            return 0.0
 
-                if is_commercial:
-                    commercial_end = t + 1.0  # +1s margem
-                    logger.debug(f"\U0001f4fa Frame t={t:.1f}s: RGB=({r},{g},{b}) → COMERCIAL")
-                else:
-                    # Se este frame NÃO é comercial, parar de procurar
-                    logger.debug(f"\U0001f4fa Frame t={t:.1f}s: RGB=({r},{g},{b}) → conteúdo")
-                    break
+        # Encontrar o ULTIMO frame de comercial para definir offset
+        last_commercial_t = 0.0
+        for t, is_comm in commercial_flags:
+            if is_comm:
+                last_commercial_t = t
 
-            except Exception as e:
-                logger.debug(f"\U0001f4fa Erro ao analisar frame t={t}: {e}")
-                continue
+        # Offset = dopo do ultimo frame comercial + 2s margem
+        offset = last_commercial_t + 2.0
 
-        if commercial_end > max_skip:
+        if offset > max_total:
             return -1.0  # comercial muito longo
-        return commercial_end
+
+        logger.info(
+            f"\U0001f4fa Comercial: {comm_count}/{len(check_times)} frames, "
+            f"\u00faltimo em t={last_commercial_t:.1f}s, offset={offset:.1f}s"
+        )
+        return offset
 
     # ------------------------------------------------------------------
     # Title Banner helpers
@@ -396,22 +418,49 @@ class VideoEditor:
                 ], check=True, capture_output=True)
                 current = outro_out
 
-            # --- Detecção de comercial por análise de frame ---
+            # --- Detecção de comercial por análise de frame (robusto) ---
             commercial_offset = self._detect_commercial_offset(current)
             if commercial_offset < 0:
-                logger.warning("\U0001f6ab Comercial muito longo \u2014 clip SKIP")
+                logger.warning("\U0001f6ab Comercial muito longo (>14s) \u2014 clip SKIP")
                 return None
 
             if commercial_offset > 0:
-                logger.info(f"\U0001f4fa Comercial detectado: trimando {commercial_offset:.1f}s do início")
+                logger.info(f"\U0001f4fa Comercial: trimando {commercial_offset:.1f}s + reset PTS")
                 trimmed = tmp / "trimmed.ts"
-                import subprocess as sp_trim
-                sp_trim.run([
+                # Pre-trim COM reset de PTS (corrige desync)
+                subprocess.run([
                     "ffmpeg", "-y", "-ss", str(commercial_offset),
-                    "-i", str(current), "-c", "copy", str(trimmed)
-                ], capture_output=True, timeout=30)
+                    "-i", str(current),
+                    "-vf", "setpts=PTS-STARTPTS",
+                    "-af", "asetpts=PTS-STARTPTS",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                    "-c:a", "aac", "-b:a", "192k",
+                    str(trimmed)
+                ], capture_output=True, timeout=60)
                 if trimmed.exists() and trimmed.stat().st_size > 1000:
-                    current = trimmed
+                    # Recheck: verificar se ainda tem comercial no trimado
+                    recheck = self._detect_commercial_offset(trimmed)
+                    if recheck < 0:
+                        logger.warning("\U0001f6ab Comercial persist\u00ea ap\u00f3s trim \u2014 SKIP")
+                        return None
+                    elif recheck > 0:
+                        logger.info(f"\U0001f4fa Recheck: mais {recheck:.1f}s de comercial")
+                        retrimmed = tmp / "retrimmed.ts"
+                        subprocess.run([
+                            "ffmpeg", "-y", "-ss", str(recheck),
+                            "-i", str(trimmed),
+                            "-vf", "setpts=PTS-STARTPTS",
+                            "-af", "asetpts=PTS-STARTPTS",
+                            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                            "-c:a", "aac", "-b:a", "192k",
+                            str(retrimmed)
+                        ], capture_output=True, timeout=60)
+                        if retrimmed.exists() and retrimmed.stat().st_size > 1000:
+                            current = retrimmed
+                        else:
+                            current = trimmed
+                    else:
+                        current = trimmed
                 else:
                     logger.warning("\u26a0\ufe0f Trim de comercial falhou, usando original")
 
@@ -482,6 +531,7 @@ class VideoEditor:
                 "-crf", "23",
                 "-c:a", "aac",
                 "-b:a", "128k",
+                "-af", "aresample=async=1:first_pts=0",
                 "-r", str(self.cfg["fps"]),
                 str(output_path)
             ]
