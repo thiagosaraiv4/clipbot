@@ -207,6 +207,18 @@ class BotEngine:
                     "banner_duration": 5,
                     "use_whisper_title": True,
                 },
+                "content_filter": {
+                    "enabled": True,
+                    "blacklist_keywords": [
+                        "aposta", "aposte", "apostar", "apostas",
+                        "bet", "bets", "betting", "odds", "stake",
+                        "cassino", "casino", "roleta", "slots",
+                        "pix", "deposite", "depósito",
+                        "código promocional", "promo code",
+                        "patrocinado", "sponsor",
+                    ],
+                    "action": "skip",
+                },
             },
             "upload": {
                 "delay_between_posts": upl["delay_sec"],
@@ -584,6 +596,12 @@ class BotEngine:
 
                         edited = editor.process(raw_clip, name, title_text=auto_title)
                         raw_clip.unlink(missing_ok=True)
+
+                        # process() retorna None se comercial detectado
+                        if edited is None:
+                            logger.warning(f"⏭️ [{label}] Clip descartado (comercial ou filtro)")
+                            continue
+
                         last_clip_time = time.time()
 
                         logger.info("✨ Gerando descrições com IA...")

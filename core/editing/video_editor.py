@@ -40,13 +40,35 @@ class VideoEditor:
             logger.error(f"Erro Whisper: {e}")
             return []
 
+    @staticmethod
+    def _wrap_subtitle_text(text: str, max_chars: int = 40, max_lines: int = 2) -> str:
+        """Quebra texto longo em linhas de ≤max_chars, máximo max_lines."""
+        words = text.split()
+        if not words:
+            return text
+        lines = []
+        current = words[0]
+        for w in words[1:]:
+            if len(current) + 1 + len(w) <= max_chars:
+                current += " " + w
+            else:
+                lines.append(current)
+                current = w
+                if len(lines) >= max_lines - 1:
+                    # Última linha: junta tudo restante
+                    remaining = [w] + words[words.index(w)+1:] if w in words else [current]
+                    current = current  # já tem a palavra atual
+                    break
+        lines.append(current)
+        return "\n".join(lines[:max_lines])
+
     def _segments_to_srt(self, segments: list, srt_path: Path):
-        """Converte segmentos Whisper para arquivo .srt."""
+        """Converte segmentos Whisper para arquivo .srt com word wrap."""
         with open(srt_path, "w", encoding="utf-8") as f:
             for i, seg in enumerate(segments, 1):
                 start = self._seconds_to_srt_time(seg["start"])
                 end   = self._seconds_to_srt_time(seg["end"])
-                text  = seg["text"].strip()
+                text  = self._wrap_subtitle_text(seg["text"].strip())
                 f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
 
     @staticmethod
@@ -56,6 +78,32 @@ class VideoEditor:
         sc = int(s % 60)
         ms = int((s % 1) * 1000)
         return f"{h:02d}:{m:02d}:{sc:02d},{ms:03d}"
+
+    # ------------------------------------------------------------------
+    # Commercial break detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_commercial_offset(segments: list, max_skip: float = 8.0) -> float:
+        """
+        Verifica se os primeiros segmentos contêm 'commercial break'.
+        Retorna:
+          >0  = segundos para pular (trim do início)
+          0   = sem comercial detectado
+          -1  = comercial muito longo (>max_skip), clip deve ser SKIP
+        """
+        if not segments:
+            return 0.0
+        for seg in segments:
+            if seg.get("end", 0) > 6.0:
+                break
+            text_lower = seg.get("text", "").lower()
+            if "commercial break" in text_lower or "commercial" in text_lower:
+                end_time = seg.get("end", 0)
+                if end_time > max_skip:
+                    return -1.0  # comercial muito longo → skip
+                return end_time + 0.5  # +0.5s de margem
+        return 0.0
 
     # ------------------------------------------------------------------
     # Title Banner helpers
@@ -241,15 +289,18 @@ class VideoEditor:
             layout    = cfg.get("layout_preset", "tiktok")
             margin_v  = cfg["subtitles"].get("margin_v", None)
             if margin_v is None:
-                _preset_margins = {"tiktok": 80, "shorts": 60, "reels": 70}
-                margin_v = _preset_margins.get(layout, 80)
+                _preset_margins = {"tiktok": 220, "shorts": 200, "reels": 210}
+                margin_v = _preset_margins.get(layout, 220)
+
+            # FontSize limitado para não dominar a tela em 1080×1920
+            effective_fs = min(font_size, 12)
 
             sub_filter = (
                 f"subtitles='{srt_esc}':"
-                f"force_style='FontName={font},FontSize={font_size},"
+                f"force_style='FontName={font},FontSize={effective_fs},"
                 f"PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,"
                 f"Outline={outline_w},Bold=1,Alignment=2,"
-                f"MarginV={margin_v}'"
+                f"MarginV={margin_v},WrapStyle=0'"
             )
 
         # ── Title banner (drawtext) ──────────────────────────────────────────
@@ -312,15 +363,55 @@ class VideoEditor:
                 current = outro_out
 
             # --- Transcrição / Legendas ---
+            segments = []
+            commercial_offset = 0.0
             if cfg_sub["enabled"]:
                 segments = self._transcribe(current, cfg_sub["language"])
                 if segments:
+                    # Detectar comercial nos primeiros segundos
+                    commercial_offset = self._detect_commercial_offset(segments)
+                    if commercial_offset < 0:
+                        logger.warning("🚫 Comercial muito longo — clip SKIP")
+                        return None
+
+                    if commercial_offset > 0:
+                        logger.info(f"📺 Comercial detectado: trimando {commercial_offset:.1f}s do início")
+                        # Ajustar timestamps dos segmentos
+                        adjusted = []
+                        for seg in segments:
+                            new_start = seg["start"] - commercial_offset
+                            new_end   = seg["end"]   - commercial_offset
+                            if new_end > 0:
+                                adjusted.append({
+                                    **seg,
+                                    "start": max(0, new_start),
+                                    "end":   new_end,
+                                })
+                        segments = adjusted
+
+                    # --- Filtro de conteúdo (apostas/propaganda) ---
+                    cf = self.cfg.get("content_filter", {})
+                    if cf.get("enabled", False) and segments:
+                        full_text = " ".join(
+                            seg.get("text", "") for seg in segments
+                        ).lower()
+                        blacklist = cf.get("blacklist_keywords", [])
+                        matched = [kw for kw in blacklist if kw.lower() in full_text]
+                        if matched and cf.get("action", "skip") == "skip":
+                            logger.warning(
+                                f"🚫 Conteúdo filtrado (blacklist): {matched[:3]} — clip SKIP"
+                            )
+                            return None
+
                     srt_path = tmp / "subtitles.srt"
                     self._segments_to_srt(segments, srt_path)
 
             # --- Monta filtro ---
             flt = self._build_ffmpeg_filter(srt_path, title_text=title_text)
-            cmd = ["ffmpeg", "-y", "-i", str(current)]
+            cmd = ["ffmpeg", "-y"]
+            if commercial_offset > 0:
+                cmd += ["-ss", str(commercial_offset)]
+            cmd += ["-i", str(current)]
 
             if flt["use_complex"]:
                 # Modo vertical: fundo blur + vídeo sobreposto
