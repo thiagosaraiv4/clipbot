@@ -564,6 +564,19 @@ class BotEngine:
         approval_mode  = config.get("system", {}).get("approval_mode", False)
         approval_top_n = int(config.get("system", {}).get("approval_top_n", 12))
 
+        # ── Watchdog: detecta live caída (raw .ts congelado) ──────────────────
+        # Stream Twitch best ~6 Mbps = ~45 MB/min crescimento esperado.
+        # Se raw_file não cresce em FROZEN_THRESHOLD segundos = anomalia
+        # (live caiu, network glitch, ffmpeg travou em reconnect HLS).
+        _WD_CHECK_INTERVAL = 15.0     # entre samples
+        _WD_FROZEN_THRESHOLD = 60.0   # sem crescimento → frozen
+        _WD_REWARN_INTERVAL = 120.0   # re-emite warn a cada 2min se permanecer frozen
+        _wd_last_size = 0
+        _wd_last_growth_t = time.time()
+        _wd_last_check_t = time.time()
+        _wd_last_warn_t = 0.0
+        _wd_state = "ok"               # "ok" | "frozen"
+
         try:
             while not self._stop_event.is_set():
                 self._stop_event.wait(timeout=1)
@@ -577,6 +590,50 @@ class BotEngine:
                 if len(processed) > 500:
                     processed = {k: t for k, t in processed.items()
                                  if now_ts - t < _PRUNE_AGE}
+
+                # ── Watchdog: live caída? ─────────────────────────────────────
+                if now_ts - _wd_last_check_t >= _WD_CHECK_INTERVAL:
+                    _wd_last_check_t = now_ts
+                    try:
+                        cur_size = raw_file.stat().st_size
+                    except Exception:
+                        cur_size = _wd_last_size
+
+                    if cur_size > _wd_last_size:
+                        # Cresceu: live OK. Resetar timer e estado se estava frozen.
+                        bytes_per_s = (cur_size - _wd_last_size) / _WD_CHECK_INTERVAL
+                        _wd_last_size = cur_size
+                        _wd_last_growth_t = now_ts
+                        if _wd_state == "frozen":
+                            logger.info(f"✅ [{label}] Stream voltou (live recuperou)")
+                            _metrics_incr("capture.recovered", platform=platform)
+                            _wd_state = "ok"
+                            _wd_last_warn_t = 0.0
+                        # Gauge informativo (uma observação por canal)
+                        try:
+                            from metrics import observe as _m_obs
+                            _m_obs("capture.bytes_per_sec", bytes_per_s,
+                                   platform=platform)
+                        except Exception:
+                            pass
+                    else:
+                        # Sem crescimento. Quanto tempo está parado?
+                        frozen_for = now_ts - _wd_last_growth_t
+                        if frozen_for >= _WD_FROZEN_THRESHOLD:
+                            should_warn = (
+                                _wd_state == "ok"   # primeira vez
+                                or (now_ts - _wd_last_warn_t >= _WD_REWARN_INTERVAL)
+                            )
+                            if should_warn:
+                                logger.warning(
+                                    f"⚠️  [{label}] Stream FROZEN — raw .ts sem "
+                                    f"crescimento há {frozen_for:.0f}s "
+                                    f"(live caiu / network glitch / ffmpeg travou)"
+                                )
+                                _metrics_incr("capture.frozen",
+                                              platform=platform, channel=clean)
+                                _wd_state = "frozen"
+                                _wd_last_warn_t = now_ts
 
                 # ── Modo aprovação: enfileira para revisão da UI ───────────────
                 if approval_mode:
