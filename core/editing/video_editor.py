@@ -414,18 +414,34 @@ class VideoEditor:
     # ------------------------------------------------------------------
 
     def _build_ffmpeg_filter(self, srt_path: Optional[Path] = None,
-                             title_text: Optional[str] = None) -> str:
+                             title_text: Optional[str] = None,
+                             face_track=None) -> str:
         """
         Constrói filtergraph ffmpeg.
-        Modo vertical: vídeo inteiro em 9:16 com fundo desfocado (sem corte).
+
+        Modo vertical:
+          • face_track presente   → speaker tracking (crop dinâmico seguindo rosto)
+          • face_track None       → fallback pad+blur (compatibilidade)
         """
         cfg = self.cfg
         w, h = cfg["resolution"]   # 1080 x 1920
 
         filters = []
 
-        if cfg["output_format"] == "vertical":
-            # ── Fundo borrado (bg) — BLUR LOW-RES ────────────────────────────
+        if cfg["output_format"] == "vertical" and face_track is not None:
+            # ── Speaker tracking: crop horizontal dinâmico + scale ────────────
+            # Não há pad nem blur — tela vertical é preenchida 100% pelo crop.
+            # Esse é o padrão OpusClip/Cutlabs/TikTok 2024.
+            from face_tracker import build_crop_expr
+            x_expr, crop_w, crop_h = build_crop_expr(face_track, out_aspect=w / h)
+            # Single chain (sem split/overlay) → muito mais rápido + visual cheio.
+            filters.append(
+                f"[0:v]crop={crop_w}:{crop_h}:{x_expr}:0,scale={w}:{h}[vout]"
+            )
+            use_complex = True
+
+        elif cfg["output_format"] == "vertical":
+            # ── Fallback pad+blur (sem face track ou hit_ratio<30%) ──────────
             # Bench medido: boxblur em 1080×1920 = ~45s/clip de 30s (75% do render!).
             # Trocando para 270×480 (16× menos pixels) + upscale após blur:
             #   • Visualmente idêntico — blur já é borrado, ninguém vê o downscale.
@@ -439,16 +455,10 @@ class VideoEditor:
                 f"boxblur=5:2,"
                 f"scale={w}:{h}"
             )
-
-            # ── Vídeo principal (fg) ────────────────────────────────────────
-            # Reduz para caber inteiramente dentro de 1080x1920 mantendo proporção
             fg = (
                 f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black@0"   # centraliza, fundo transparente
+                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black@0"
             )
-
-            # ── Sobrepõe fg sobre bg ────────────────────────────────────────
-            # Resultado: fundo desfocado + vídeo centralizado nítido por cima
             filters.append(f"[0:v]split=2[bg_raw][fg_raw]")
             filters.append(f"[bg_raw]{bg}[bg]")
             filters.append(f"[fg_raw]{fg}[fg]")
@@ -629,8 +639,29 @@ class VideoEditor:
                     srt_path = tmp / "subtitles.srt"
                     self._segments_to_srt(segments, srt_path)
 
+            # --- Speaker tracking (Iter2): detecta rosto e propõe crop dinâmico ---
+            # Custo: ~3-12s por clip (extract frames sparse + Haar Cascade CPU).
+            # Se hit_ratio < 30% → None → fallback automático para pad+blur.
+            face_track = None
+            if self.cfg.get("output_format") == "vertical":
+                try:
+                    from face_tracker import compute_trajectory
+                    # Estima duração do current via filesize (heurística leve)
+                    # ou simplesmente passa 30s default (face_tracker não usa de fato)
+                    with _Timer("editor.face_tracking"):
+                        face_track = compute_trajectory(current, duration_sec=30.0)
+                    if face_track is not None:
+                        _metrics_incr("editor.face_track_hit",
+                                      hit_ratio_band=f"{int(face_track.hit_ratio*10)*10}")
+                    else:
+                        _metrics_incr("editor.face_track_miss")
+                except Exception as e:
+                    logger.debug(f"face tracking falhou (fallback): {e}")
+                    _metrics_incr("editor.face_track_error")
+
             # --- Monta filtro ---
-            flt = self._build_ffmpeg_filter(srt_path, title_text=title_text)
+            flt = self._build_ffmpeg_filter(srt_path, title_text=title_text,
+                                            face_track=face_track)
             cmd = ["ffmpeg", "-y", "-i", str(current)]
 
             if flt["use_complex"]:
