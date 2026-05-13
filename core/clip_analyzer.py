@@ -1,13 +1,17 @@
 """
 ClipBot v3 — Clip Analyzer
-Funções leves de análise de vídeo/áudio usando apenas FFmpeg + stdlib.
-Sem dependências externas (sem OpenCV, sem numpy).
+Funções leves de análise de vídeo/áudio usando FFmpeg + numpy vetorizado.
+
+PR3d: motion + audio RMS migrados de loop Python para numpy.
+       ~50× speedup mensurável.
 """
-import subprocess
-import struct
-import math
 import logging
 from pathlib import Path
+
+import numpy as np
+
+from ffmpeg_runner import run_ffmpeg
+from metrics import Timer as _Timer
 
 logger = logging.getLogger("clipbot.clip_analyzer")
 
@@ -17,7 +21,12 @@ logger = logging.getLogger("clipbot.clip_analyzer")
 # ──────────────────────────────────────────────────────────────────────
 
 def _extract_audio_rms(video_path, start_sec: float, duration: float) -> float:
-    """Extrai áudio mono PCM f32le e calcula RMS."""
+    """Extrai áudio mono PCM f32le e calcula RMS via numpy vetorizado."""
+    with _Timer("analyzer.audio_rms"):
+        return _extract_audio_rms_impl(video_path, start_sec, duration)
+
+
+def _extract_audio_rms_impl(video_path, start_sec: float, duration: float) -> float:
     cmd = [
         "ffmpeg", "-ss", str(start_sec), "-i", str(video_path),
         "-t", str(duration),
@@ -26,21 +35,21 @@ def _extract_audio_rms(video_path, start_sec: float, duration: float) -> float:
         "pipe:1"
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=15)
-        if result.returncode != 0 or len(result.stdout) < 4:
+        # audio_rms chamado várias vezes por clip; quiet evita poluir log
+        result = run_ffmpeg(cmd, label="audio_rms",
+                            timeout=15, capture_stdout=True, quiet=True)
+        if not result.ok or len(result.stdout) < 4:
             return 0.0
 
-        raw = result.stdout
-        n_samples = len(raw) // 4
-        if n_samples == 0:
+        # Trunca para múltiplo de 4 bytes (sample float32) para evitar erro do frombuffer
+        raw_len = (len(result.stdout) // 4) * 4
+        if raw_len == 0:
             return 0.0
-
-        sum_sq = 0.0
-        for i in range(n_samples):
-            sample = struct.unpack_from('<f', raw, i * 4)[0]
-            sum_sq += sample * sample
-
-        return math.sqrt(sum_sq / n_samples)
+        audio = np.frombuffer(result.stdout[:raw_len], dtype=np.float32)
+        if audio.size == 0:
+            return 0.0
+        # RMS = sqrt(mean(x^2)) — totalmente vetorizado
+        return float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
 
     except Exception as e:
         logger.debug(f"Erro RMS: {e}")
@@ -49,41 +58,45 @@ def _extract_audio_rms(video_path, start_sec: float, duration: float) -> float:
 
 def _extract_motion_score(video_path, start_sec: float, duration: float) -> float:
     """
-    Extrai frames a 2fps em grayscale 160x90, calcula motion como
+    Extrai frames a 2fps em grayscale 160x90 e calcula motion como
     média das diferenças absolutas entre frames consecutivos.
+    Implementação numpy vetorizada (~50× mais rápida que loop Python).
     """
+    with _Timer("analyzer.motion"):
+        return _extract_motion_score_impl(video_path, start_sec, duration)
+
+
+def _extract_motion_score_impl(video_path, start_sec: float, duration: float) -> float:
+    FRAME_W = 160
+    FRAME_H = 90
+    FRAME_SIZE = FRAME_W * FRAME_H
+
     cmd = [
         "ffmpeg", "-ss", str(start_sec), "-i", str(video_path),
         "-t", str(duration),
-        "-vf", "fps=2,scale=160:90,format=gray",
+        "-vf", f"fps=2,scale={FRAME_W}:{FRAME_H},format=gray",
         "-f", "rawvideo", "-pix_fmt", "gray",
         "pipe:1"
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=20)
-        if result.returncode != 0 or len(result.stdout) < 160 * 90 * 2:
+        # motion_score chamado várias vezes por clip; quiet evita poluir log
+        result = run_ffmpeg(cmd, label="motion_score",
+                            timeout=20, capture_stdout=True, quiet=True)
+        if not result.ok or len(result.stdout) < FRAME_SIZE * 2:
             return 0.0
 
+        # Trunca para múltiplo de FRAME_SIZE
         raw = result.stdout
-        frame_size = 160 * 90
-        n_frames = len(raw) // frame_size
-
+        n_frames = len(raw) // FRAME_SIZE
         if n_frames < 2:
             return 0.0
 
-        total_diff = 0.0
-        n_diffs = 0
-
-        for i in range(1, n_frames):
-            offset_prev = (i - 1) * frame_size
-            offset_curr = i * frame_size
-            frame_diff = 0
-            for p in range(frame_size):
-                frame_diff += abs(raw[offset_curr + p] - raw[offset_prev + p])
-            total_diff += frame_diff / frame_size
-            n_diffs += 1
-
-        return total_diff / n_diffs if n_diffs > 0 else 0.0
+        usable = raw[:n_frames * FRAME_SIZE]
+        # uint8 → int16 para diff sem overflow; reshape (n_frames, FRAME_SIZE)
+        frames = np.frombuffer(usable, dtype=np.uint8).reshape(n_frames, FRAME_SIZE).astype(np.int16)
+        # diff entre frames consecutivos, abs, média sobre tudo
+        diffs = np.abs(np.diff(frames, axis=0))
+        return float(diffs.mean())
 
     except Exception as e:
         logger.debug(f"Erro motion: {e}")
@@ -136,6 +149,12 @@ def find_hook_start(video_path, original_start: float,
     [original_start - pre_roll, original_start] em steps de 0.5s.
     Retorna o primeiro timestamp onde a 'energia' ultrapassa 60% do pico.
     """
+    with _Timer("analyzer.hook_find", pre_roll=pre_roll):
+        return _find_hook_start_impl(video_path, original_start, pre_roll, audio_norm, motion_norm)
+
+
+def _find_hook_start_impl(video_path, original_start: float, pre_roll: float,
+                          audio_norm: float, motion_norm: float) -> float:
     video_path = Path(video_path)
     window_start = max(0.0, original_start - pre_roll)
     step = 0.5

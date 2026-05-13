@@ -29,6 +29,8 @@ Regra de atualização:
 import json
 import logging
 import os
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -111,11 +113,13 @@ def score_moment(entry: dict, weights: Optional[Dict[str, float]] = None) -> flo
 def _duration_bonus(duration: float) -> float:
     """
     Bonifica clips no sweet spot (8-15s).
-    <8s ou >20s = penalidade, >30s = penalidade maior.
+    <8s = penalidade leve, 15-20s = leve, >20s = moderada, >30s = forte.
     """
     if 8.0 <= duration <= 15.0:
         return 1.0
-    elif duration < 8.0 or duration <= 20.0:
+    elif duration < 8.0:
+        return 0.85
+    elif duration <= 20.0:
         return 0.9
     elif duration <= 30.0:
         return 0.8
@@ -196,25 +200,55 @@ def score_moment_advanced(
 
 
 # ─── Channel History ──────────────────────────────────────────────────────────
+# Cache TTL para evitar disk read em hot path:
+# score_moment_advanced é chamado ~1×/s/momento no monitor; sem cache vira N reads/s.
+
+_CHANNEL_HISTORY_TTL_SEC = 5.0
+_channel_cache: dict = {}
+_channel_cache_ts: float = 0.0
+_channel_cache_lock = threading.Lock()
+
 
 def _load_channel_history() -> dict:
-    """Carrega histórico de canais do disco."""
+    """
+    Carrega histórico do disco com cache TTL=5s.
+    Reduz de N reads/s para 1 read/5s em monitor com muitos canais.
+    """
+    global _channel_cache, _channel_cache_ts
+    now = time.monotonic()
+    with _channel_cache_lock:
+        if _channel_cache_ts and (now - _channel_cache_ts) < _CHANNEL_HISTORY_TTL_SEC:
+            # Cache válido: cópia rasa para isolamento do caller
+            return dict(_channel_cache)
+    # Cache stale ou vazio: ler disco
     if not CHANNEL_HISTORY.exists():
+        with _channel_cache_lock:
+            _channel_cache = {}
+            _channel_cache_ts = now
         return {}
     try:
-        return json.loads(CHANNEL_HISTORY.read_text(encoding="utf-8"))
+        data = json.loads(CHANNEL_HISTORY.read_text(encoding="utf-8"))
     except Exception:
-        return {}
+        data = {}
+    with _channel_cache_lock:
+        _channel_cache = data
+        _channel_cache_ts = now
+        return dict(data)
 
 
 def _save_channel_history(history: dict) -> None:
-    """Salva histórico de canais no disco."""
+    """Salva histórico no disco e invalida cache (próxima leitura recarrega)."""
+    global _channel_cache, _channel_cache_ts
     try:
         APP_DATA.mkdir(parents=True, exist_ok=True)
         CHANNEL_HISTORY.write_text(
             json.dumps(history, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        # Atualiza cache em vez de invalidar — evita roundtrip desnecessário
+        with _channel_cache_lock:
+            _channel_cache = dict(history)
+            _channel_cache_ts = time.monotonic()
     except Exception as ex:
         logger.debug(f"channel_history save falhou: {ex}")
 

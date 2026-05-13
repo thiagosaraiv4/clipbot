@@ -5,32 +5,135 @@ watermark, intro/outro e exporta em formato final.
 """
 
 import logging
-import subprocess
 import tempfile
 import textwrap
 from pathlib import Path
 from typing import Optional
 
+from ffmpeg_runner import run_ffmpeg
+from metrics import Timer as _Timer, incr as _metrics_incr
+
 logger = logging.getLogger("ClipBot.Editor")
 
 
 class VideoEditor:
+    # NVENC detection cached at class-level (uma vez por sessão de processo).
+    # _runtime_disabled flag permite fallback automático se NVENC quebrar
+    # mid-session (driver crash, contention, etc.).
+    _nvenc_available:        Optional[bool] = None
+    _nvenc_runtime_disabled: bool           = False
+
     def __init__(self, config: dict, output_folder: str):
         self.cfg    = config["editing"]
         self.out_dir = Path(output_folder)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
+    # NVENC detection + encoder args
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _detect_nvenc(cls) -> bool:
+        """
+        Detecta UMA VEZ se h264_nvenc funciona nesta máquina.
+        Faz encode sintético de 0.1s para validar codec + driver + permissões
+        (não basta conferir se ffmpeg foi compilado com nvenc).
+        Resultado cacheado em class var.
+        """
+        if cls._nvenc_available is not None:
+            return cls._nvenc_available
+        try:
+            r = run_ffmpeg([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "color=size=320x240:duration=0.1:rate=30",
+                "-c:v", "h264_nvenc", "-preset:v", "p5",
+                "-f", "null", "-",
+            ], label="detect_nvenc", timeout=10, quiet=True)
+            cls._nvenc_available = r.ok
+            if r.ok:
+                logger.info("✅ NVENC disponível — usando h264_nvenc no render")
+            else:
+                logger.info("ℹ️  NVENC indisponível — usando libx264 no render")
+        except Exception as e:
+            logger.debug(f"nvenc detect: {e}")
+            cls._nvenc_available = False
+        return cls._nvenc_available
+
+    @classmethod
+    def _use_nvenc(cls) -> bool:
+        """True se NVENC detectado E não desabilitado em runtime."""
+        return cls._detect_nvenc() and not cls._nvenc_runtime_disabled
+
+    def _encoder_args(self, use_nvenc: bool) -> list:
+        """
+        Retorna args ffmpeg para encoder de vídeo.
+
+        NVENC config (1660 Super Turing 7th gen):
+          • preset p5 = quality balanced (NÃO usar slow/medium antigos — deprecated)
+          • cq=22 quality target ≈ libx264 CRF 22 (melhor que 23)
+          • spatial_aq + temporal_aq habilitados — qualidade visual ↑↑ em scenes complexas
+          • bf=3 + refs=3 = compressão melhor sem custo perceptível
+          • rc-lookahead=32 = compressão mais inteligente
+          • profile high level 4.1 yuv420p = compat máxima TikTok/Instagram/YouTube
+
+        libx264 fallback: preset fast CRF 23 (estado anterior).
+        """
+        fps = str(self.cfg.get("fps", 30))
+        if use_nvenc:
+            # NVENC config validada empiricamente em 1660 Super (Turing 7th gen):
+            # - level omitido: 1080×1920 60fps excede level 4.1 (max ~245k MB/s).
+            #   Auto-level evita rc=-22 sem prejuízo de compat (TikTok/IG aceitam 4.2+).
+            # - tune=hq + rc=vbr + cq=22: equivale ~CRF 22 com qualidade espacial.
+            # - spatial_aq + temporal_aq: AQ habilitado, qualidade visual ↑↑ em scenes complexas.
+            # - bf=3 refs=3: B-frames + reference frames = compressão melhor.
+            # - rc-lookahead=32: análise temporal melhor.
+            return [
+                "-c:v", "h264_nvenc",
+                "-preset:v", "p5",
+                "-tune:v", "hq",
+                "-rc:v", "vbr",
+                "-cq:v", "22",
+                "-b:v", "0",
+                "-maxrate:v", "12M",
+                "-bufsize:v", "24M",
+                "-profile:v", "high",
+                "-spatial_aq", "1",
+                "-temporal_aq", "1",
+                "-bf", "3",
+                "-refs", "3",
+                "-rc-lookahead", "32",
+                "-pix_fmt", "yuv420p",
+                "-r", fps,
+            ]
+        else:
+            return [
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-r", fps,
+            ]
+
+    # ------------------------------------------------------------------
     # Transcrição com Whisper
     # ------------------------------------------------------------------
 
     def _transcribe(self, video_path: Path, language: str) -> list:
-        """Gera legenda via OpenAI Whisper. Retorna lista de segmentos."""
+        """
+        Gera legenda via Whisper (singleton). Retorna lista de segmentos.
+        word_timestamps=False: legenda atual usa só seg.start/end → custo extra
+        de word-level é desperdício. Ativar quando ASS karaoke entrar (Iter2).
+        """
         try:
-            import whisper
+            from whisper_service import WhisperService
             logger.info("🎤 Transcrevendo com Whisper...")
-            model = whisper.load_model("small")
-            result = model.transcribe(str(video_path), language=language, word_timestamps=True)
+            # device="auto": tenta CUDA INT8_FP16 → CPU INT8 → openai-whisper CPU
+            service = WhisperService.get(size="small", device="auto")
+            with _Timer("editor.whisper", backend=service.backend or "unknown"):
+                result = service.transcribe(
+                    video_path, language=language,
+                    word_timestamps=False, beam_size=1,
+                )
             logger.info("✅ Transcrição concluída.")
             return result["segments"]
         except ImportError:
@@ -90,7 +193,6 @@ class VideoEditor:
         com padrão roxo/azul da Twitch (R<120, B>140, B-R>40).
         Retorna True se >= 45% dos pixels são comercial.
         """
-        import subprocess as sp
         try:
             cmd = [
                 "ffmpeg", "-ss", str(timestamp), "-i", str(video_path),
@@ -98,8 +200,10 @@ class VideoEditor:
                 "-f", "rawvideo", "-pix_fmt", "rgb24",
                 "pipe:1"
             ]
-            result = sp.run(cmd, capture_output=True, timeout=10)
-            if result.returncode != 0 or len(result.stdout) < 64 * 36 * 3:
+            # commercial_frame chamado ×6 por clip; quiet evita poluir log
+            result = run_ffmpeg(cmd, label="commercial_frame",
+                                timeout=10, capture_stdout=True, quiet=True)
+            if not result.ok or len(result.stdout) < 64 * 36 * 3:
                 return False
 
             pixels = result.stdout
@@ -191,11 +295,25 @@ class VideoEditor:
 
     @staticmethod
     def _escape_drawtext(text: str) -> str:
-        """Escapa caracteres especiais para o filtro drawtext do FFmpeg."""
+        """
+        Escapa caracteres especiais para drawtext do FFmpeg.
+
+        Aspas simples são INTRATÁVEIS dentro de text='...': drawtext NÃO aceita
+        \\' como escape — a primeira ' termina a string e o filter_complex
+        inteiro quebra silenciosamente (label [vout] some, render falha com
+        'Output with label vout does not exist'). Dois templates de keyword
+        produziam títulos como "ELE DISSE 'CLIP'!" → quebravam render.
+
+        Solução: substituir ' por aspas tipográficas Unicode U+2019 (')
+        antes de qualquer escape. Visualmente idêntico, drawtext-safe.
+        """
+        # Substituir aspas simples por aspas tipográficas Unicode ANTES de escapar
+        text = text.replace("'", "’")
+        # Aspas duplas idem (paranoia + estilo)
+        text = text.replace('"', "”")
         # Ordem importa: \ primeiro
         text = text.replace("\\", "\\\\")
         text = text.replace(":", "\\:")
-        text = text.replace("'", "\\'")
         text = text.replace("%", "\\%")
         text = text.replace("\n", "\\n")
         return text
@@ -307,12 +425,19 @@ class VideoEditor:
         filters = []
 
         if cfg["output_format"] == "vertical":
-            # ── Fundo borrado (bg) ──────────────────────────────────────────
-            # Escala para cobrir todo o 9:16 e aplica blur forte
+            # ── Fundo borrado (bg) — BLUR LOW-RES ────────────────────────────
+            # Bench medido: boxblur em 1080×1920 = ~45s/clip de 30s (75% do render!).
+            # Trocando para 270×480 (16× menos pixels) + upscale após blur:
+            #   • Visualmente idêntico — blur já é borrado, ninguém vê o downscale.
+            #   • boxblur com sigma menor (5:2 em vez de 20:5) compensa resolução
+            #     menor mantendo aparência.
+            #   • Render 60s → 14s no libx264; com NVENC vira ~10s.
+            BG_W, BG_H = 270, 480
             bg = (
-                f"scale={w}:{h}:force_original_aspect_ratio=increase,"
-                f"crop={w}:{h},"
-                f"boxblur=20:5"
+                f"scale={BG_W}:{BG_H}:force_original_aspect_ratio=increase,"
+                f"crop={BG_W}:{BG_H},"
+                f"boxblur=5:2,"
+                f"scale={w}:{h}"
             )
 
             # ── Vídeo principal (fg) ────────────────────────────────────────
@@ -382,6 +507,16 @@ class VideoEditor:
         """Processa um clip bruto e retorna o arquivo final editado."""
         output_path = self.out_dir / f"{output_name}.mp4"
         logger.info(f"✂️  Editando: {input_path.name} → {output_path.name}")
+        # Timer end-to-end (inclui commercial detect, whisper, render)
+        _t = _Timer("editor.process_total")
+        _t.__enter__()
+        try:
+            return self._process_inner(input_path, output_path, title_text)
+        finally:
+            _t.__exit__(None, None, None)
+
+    def _process_inner(self, input_path: Path, output_path: Path,
+                       title_text: Optional[str] = None) -> Path:
 
         cfg_sub  = self.cfg["subtitles"]
         cfg_wm   = self.cfg["watermark"]
@@ -400,10 +535,12 @@ class VideoEditor:
                 concat_list = tmp / "concat_intro.txt"
                 with open(concat_list, "w") as f:
                     f.write(f"file '{cfg_in['video_path']}'\nfile '{current}'\n")
-                subprocess.run([
+                r = run_ffmpeg([
                     "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                    "-i", str(concat_list), "-c", "copy", str(intro_out)
-                ], check=True, capture_output=True)
+                    "-i", str(concat_list), "-c", "copy", str(intro_out),
+                ], label="concat_intro", timeout=120)
+                if not r.ok:
+                    raise RuntimeError(f"intro concat falhou rc={r.returncode}")
                 current = intro_out
 
             # --- Outro ---
@@ -412,15 +549,19 @@ class VideoEditor:
                 concat_list = tmp / "concat_outro.txt"
                 with open(concat_list, "w") as f:
                     f.write(f"file '{current}'\nfile '{cfg_out['video_path']}'\n")
-                subprocess.run([
+                r = run_ffmpeg([
                     "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                    "-i", str(concat_list), "-c", "copy", str(outro_out)
-                ], check=True, capture_output=True)
+                    "-i", str(concat_list), "-c", "copy", str(outro_out),
+                ], label="concat_outro", timeout=120)
+                if not r.ok:
+                    raise RuntimeError(f"outro concat falhou rc={r.returncode}")
                 current = outro_out
 
             # --- Detecção de comercial por análise de frame (robusto) ---
-            commercial_offset = self._detect_commercial_offset(current)
+            with _Timer("editor.commercial_detect"):
+                commercial_offset = self._detect_commercial_offset(current)
             if commercial_offset < 0:
+                _metrics_incr("editor.skipped", reason="commercial_long")
                 logger.warning("\U0001f6ab Comercial muito longo (>14s) \u2014 clip SKIP")
                 return None
 
@@ -428,33 +569,34 @@ class VideoEditor:
                 logger.info(f"\U0001f4fa Comercial: trimando {commercial_offset:.1f}s + reset PTS")
                 trimmed = tmp / "trimmed.ts"
                 # Pre-trim COM reset de PTS (corrige desync)
-                subprocess.run([
+                run_ffmpeg([
                     "ffmpeg", "-y", "-ss", str(commercial_offset),
                     "-i", str(current),
                     "-vf", "setpts=PTS-STARTPTS",
                     "-af", "asetpts=PTS-STARTPTS",
                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
                     "-c:a", "aac", "-b:a", "192k",
-                    str(trimmed)
-                ], capture_output=True, timeout=60)
+                    str(trimmed),
+                ], label="commercial_pretrim", timeout=60)
                 if trimmed.exists() and trimmed.stat().st_size > 1000:
                     # Recheck: verificar se ainda tem comercial no trimado
                     recheck = self._detect_commercial_offset(trimmed)
                     if recheck < 0:
                         logger.warning("\U0001f6ab Comercial persist\u00ea ap\u00f3s trim \u2014 SKIP")
+                        _metrics_incr("editor.skipped", reason="commercial_persistent")
                         return None
                     elif recheck > 0:
                         logger.info(f"\U0001f4fa Recheck: mais {recheck:.1f}s de comercial")
                         retrimmed = tmp / "retrimmed.ts"
-                        subprocess.run([
+                        run_ffmpeg([
                             "ffmpeg", "-y", "-ss", str(recheck),
                             "-i", str(trimmed),
                             "-vf", "setpts=PTS-STARTPTS",
                             "-af", "asetpts=PTS-STARTPTS",
                             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
                             "-c:a", "aac", "-b:a", "192k",
-                            str(retrimmed)
-                        ], capture_output=True, timeout=60)
+                            str(retrimmed),
+                        ], label="commercial_retrim", timeout=60)
                         if retrimmed.exists() and retrimmed.stat().st_size > 1000:
                             current = retrimmed
                         else:
@@ -478,6 +620,7 @@ class VideoEditor:
                         blacklist = cf.get("blacklist_keywords", [])
                         matched = [kw for kw in blacklist if kw.lower() in full_text]
                         if matched and cf.get("action", "skip") == "skip":
+                            _metrics_incr("editor.skipped", reason="content_filter")
                             logger.warning(
                                 f"\U0001f6ab Conteúdo filtrado (blacklist): {matched[:3]} \u2014 clip SKIP"
                             )
@@ -525,21 +668,51 @@ class VideoEditor:
                 vf = ",".join(vf_parts)
                 cmd += ["-vf", vf]
 
-            cmd += [
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-crf", "23",
-                "-c:a", "aac",
-                "-b:a", "128k",
+            # Encoder: NVENC se disponível, libx264 fallback. Áudio idem em ambos.
+            use_nvenc = self._use_nvenc()
+            video_args = self._encoder_args(use_nvenc=use_nvenc)
+            audio_args = [
+                "-c:a", "aac", "-b:a", "128k",
                 "-af", "aresample=async=1:first_pts=0",
-                "-r", str(self.cfg["fps"]),
-                str(output_path)
             ]
+            mux_args = ["-movflags", "+faststart"]   # TikTok/IG preview-friendly
+            cmd_base = list(cmd)   # snapshot p/ retry caso NVENC falhe runtime
+            cmd += video_args + audio_args + mux_args + [str(output_path)]
 
-            logger.debug(f"ffmpeg cmd: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, timeout=300)
-            if result.returncode != 0:
-                raise RuntimeError(f"ffmpeg edição falhou:\n{result.stderr.decode()}")
+            encoder_tag = "nvenc" if use_nvenc else "libx264"
+            with _Timer("editor.render_final",
+                        format=self.cfg.get("output_format", "?"),
+                        encoder=encoder_tag):
+                result = run_ffmpeg(cmd, label="render_final",
+                                    timeout=300, log_command=True)
 
+            # Fallback runtime: NVENC falha → desabilita resto da sessão + retry libx264
+            if not result.ok and use_nvenc:
+                tail_blob = " ".join(result.stderr_tail[-30:]).lower()
+                if "nvenc" in tail_blob or "cuda" in tail_blob or "gpu" in tail_blob:
+                    logger.warning(
+                        f"⚠️  NVENC runtime falhou (rc={result.returncode}) — "
+                        "fallback para libx264 e desabilitando NVENC nesta sessão"
+                    )
+                    self.__class__._nvenc_runtime_disabled = True
+                    _metrics_incr("editor.nvenc_runtime_disabled")
+                    # Retry com libx264
+                    cmd_retry = cmd_base + self._encoder_args(use_nvenc=False) \
+                                + audio_args + mux_args + [str(output_path)]
+                    with _Timer("editor.render_final",
+                                format=self.cfg.get("output_format", "?"),
+                                encoder="libx264_fallback"):
+                        result = run_ffmpeg(cmd_retry, label="render_final",
+                                            timeout=300, log_command=True)
+
+            if not result.ok:
+                _metrics_incr("editor.render_failed",
+                              rc=str(result.returncode), encoder=encoder_tag)
+                tail = "\n".join(result.stderr_tail[-30:])
+                raise RuntimeError(
+                    f"ffmpeg render falhou rc={result.returncode}:\n{tail}"
+                )
+
+        _metrics_incr("editor.clips_generated", encoder=encoder_tag)
         logger.info(f"✅ Clip editado: {output_path}")
         return output_path

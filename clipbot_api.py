@@ -248,16 +248,35 @@ class ClipBotAPI:
             return {"ok": False, "error": str(e)}
 
     def open_in_explorer(self, path: str) -> dict:
-        """Abre o arquivo no explorador nativo do OS."""
-        import subprocess, os, sys as _sys
+        """
+        Abre o arquivo no explorador nativo do OS — fire-and-forget.
+
+        Em vez de context manager (que bloquearia em proc.wait), descartamos a
+        ref do Popen explicitamente. GC limpa o handle quando o objeto sair
+        do escopo. stdin/stdout/stderr=DEVNULL evita herança de FDs do parent.
+        Em Windows, DETACHED_PROCESS desacopla totalmente do Job Object para
+        que o explorer sobreviva ao shutdown do ClipBot (file manager é UX
+        independente — não queremos que feche junto).
+        """
+        import subprocess, sys as _sys
         try:
             p = Path(path)
+            common_kw = dict(
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True,
+            )
             if _sys.platform == "win32":
-                subprocess.Popen(["explorer", "/select,", str(p)])
+                # DETACHED_PROCESS (0x8) + CREATE_BREAKAWAY_FROM_JOB (0x1000000):
+                # explorer escapa do Job Object e sobrevive ao ClipBot fechar.
+                creationflags = 0x00000008 | 0x01000000
+                _ = subprocess.Popen(
+                    ["explorer", "/select,", str(p)],
+                    creationflags=creationflags, **common_kw,
+                )
             elif _sys.platform == "darwin":
-                subprocess.Popen(["open", "-R", str(p)])
+                _ = subprocess.Popen(["open", "-R", str(p)], **common_kw)
             else:
-                subprocess.Popen(["xdg-open", str(p.parent)])
+                _ = subprocess.Popen(["xdg-open", str(p.parent)], **common_kw)
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}

@@ -13,10 +13,11 @@ API:
 
 import logging
 import random
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional
+
+from ffmpeg_runner import run_ffmpeg
 
 logger = logging.getLogger("ClipBot.Title")
 
@@ -115,9 +116,11 @@ class TitleGenerator:
 
     def _extract_short_audio(self, video_path: Path, duration: float = 5.0) -> Optional[Path]:
         """Extrai os primeiros N segundos de áudio como WAV temporário."""
+        tmp_path: Optional[Path] = None
         try:
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.close()
+            tmp_path = Path(tmp.name)
             cmd = [
                 "ffmpeg", "-y",
                 "-i", str(video_path),
@@ -126,19 +129,29 @@ class TitleGenerator:
                 "-ar", "16000", "-ac", "1",
                 tmp.name,
             ]
-            subprocess.run(
-                cmd, capture_output=True, timeout=15,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if Path(tmp.name).exists() and Path(tmp.name).stat().st_size > 1000:
-                return Path(tmp.name)
+            result = run_ffmpeg(cmd, label="title_extract_audio", timeout=15)
+            if not result.ok:
+                # Cleanup tempfile em falha (era leak no código antigo)
+                try: tmp_path.unlink(missing_ok=True)
+                except Exception: pass
+                return None
+            if tmp_path.exists() and tmp_path.stat().st_size > 1000:
+                return tmp_path
             return None
         except Exception as e:
             logger.debug(f"Extração de áudio curto falhou: {e}")
+            if tmp_path is not None:
+                try: tmp_path.unlink(missing_ok=True)
+                except Exception: pass
             return None
 
     def _whisper_micro(self, video_path: Path) -> Optional[str]:
-        """Transcreve primeiros 5s do clip com Whisper tiny."""
+        """
+        Transcreve primeiros 5s do clip via Whisper singleton.
+        Reutiliza o MESMO modelo "small" carregado pelo video_editor — em vez
+        de carregar "tiny" separado (que dobrava RAM). Para 5s de áudio, small
+        no CPU custa ~0.5-1s e dá título mais preciso que tiny.
+        """
         if not self.use_whisper:
             return None
 
@@ -147,19 +160,19 @@ class TitleGenerator:
             return None
 
         try:
-            import whisper
-            model  = whisper.load_model("tiny")
-            result = model.transcribe(str(audio_file), language=self.language)
-            text   = result.get("text", "").strip()
-
-            # Limpeza do áudio
-            if audio_file.exists():
-                audio_file.unlink(missing_ok=True)
+            from whisper_service import WhisperService
+            # Reusa singleton — mesmo modelo do video_editor (CUDA se disponível)
+            service = WhisperService.get(size="small", device="auto")
+            result  = service.transcribe(
+                audio_file, language=self.language,
+                word_timestamps=False, beam_size=1,
+            )
+            text = result.get("text", "").strip()
 
             if not text or len(text) < 3:
                 return None
 
-            # Formata: pega os primeiras palavras significativas
+            # Formata: pega as primeiras palavras significativas
             title = self._clean_whisper_text(text)
             if title and len(title) >= 4:
                 logger.info(f"🎤 Título via Whisper: \"{title}\"")
@@ -175,7 +188,8 @@ class TitleGenerator:
             return None
         finally:
             if audio_file and audio_file.exists():
-                audio_file.unlink(missing_ok=True)
+                try: audio_file.unlink(missing_ok=True)
+                except Exception: pass
 
     def _clean_whisper_text(self, raw_text: str) -> Optional[str]:
         """

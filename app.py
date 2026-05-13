@@ -28,8 +28,25 @@ logging.getLogger("ClipBot").setLevel(logging.DEBUG)
 
 BASE = Path(__file__).parent
 sys.path.insert(0, str(BASE))
+sys.path.insert(0, str(BASE / "core"))
+
+# ── Job Object (Windows): mata todos os children se Python morrer ───────────
+# DEVE rodar ANTES de qualquer subprocess.Popen ser criado. Por isso primeiro.
+try:
+    from job_object import setup_job_object
+    setup_job_object()
+except Exception:
+    pass
 
 from clipbot_api import ClipBotAPI
+
+# ── Telemetria: bootstrap antes de qualquer engine work ──────────────────────
+try:
+    from metrics import start_reporter, stop_reporter
+    from system_sampler import start_sampler, stop_sampler
+    _HAS_METRICS = True
+except ImportError:
+    _HAS_METRICS = False
 
 
 def main():
@@ -46,6 +63,17 @@ def main():
         sys.exit(1)
 
     api = ClipBotAPI()
+
+    # ── Telemetria: reporter + sampler em background (custo <0.1% CPU) ──────
+    if _HAS_METRICS:
+        try:
+            start_reporter(interval=60.0)
+            from credentials import load_settings as _ls
+            _cfg = _ls()
+            _clips = Path(_cfg.get("system", {}).get("clips_folder", BASE / "clips"))
+            start_sampler(clips_dir=_clips)
+        except Exception:
+            pass
 
     window = webview.create_window(
         title            = "ClipBot v2.0",
@@ -76,6 +104,12 @@ def main():
         api._stop_poll()
         if api._engine and api._engine.is_running:
             api._engine.stop()
+        if _HAS_METRICS:
+            try:
+                stop_sampler()
+                stop_reporter()
+            except Exception:
+                pass
 
     window.events.loaded  += on_loaded
     window.events.closing += on_closing

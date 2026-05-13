@@ -18,6 +18,8 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from ffmpeg_runner import FFmpegSession, run_ffmpeg, kill_tree
+
 logger = logging.getLogger("ClipBot.Capture")
 
 
@@ -44,6 +46,27 @@ def _kill_proc(proc, timeout: float = 3.0) -> None:
         pass
 
 
+_active_captures: list = []
+_captures_lock = threading.Lock()
+
+
+def _cleanup_all_captures() -> None:
+    with _captures_lock:
+        captures = list(_active_captures)
+    for cap in captures:
+        # Preferir close() da session (drena stderr buffer + log estruturado)
+        if getattr(cap, "current_session", None) is not None:
+            try:
+                cap.current_session.close()
+            except Exception:
+                kill_tree(cap.current_process)
+        else:
+            _kill_proc(cap.current_process)
+
+
+atexit.register(_cleanup_all_captures)
+
+
 class StreamCapture:
 
     def __init__(self, config: dict, clips_folder: str):
@@ -52,17 +75,21 @@ class StreamCapture:
         self.clips_folder.mkdir(parents=True, exist_ok=True)
 
         self.is_recording    = False
-        self.current_process = None
+        self.current_session = None    # FFmpegSession ativo (ou None)
+        self.current_process = None    # alias do session.proc — mantido p/ legacy callers
         self.current_file    = None
         self.start_time      = None
         self._lock           = threading.Lock()
 
-        # Registra atexit UMA única vez, apontando para self.current_process
-        atexit.register(self._atexit_cleanup)
+        with _captures_lock:
+            _active_captures.append(self)
 
-    def _atexit_cleanup(self) -> None:
-        """Chamado via atexit: mata o processo atual (se houver)."""
-        _kill_proc(self.current_process)
+    def _unregister(self) -> None:
+        with _captures_lock:
+            try:
+                _active_captures.remove(self)
+            except ValueError:
+                pass
 
     # ──────────────────────────────────────────────────────────────────────────
     # URL Resolvers
@@ -195,16 +222,21 @@ class StreamCapture:
                 str(out_file),
             ]
 
-            proc = subprocess.Popen(
+            # Long-running session: stderr drenado em thread, sem deadlock por
+            # buffer cheio. capture_stdout=False (ffmpeg escreve direto no arquivo).
+            # quiet=True: capture sempre é killed no shutdown (rc!=0 esperado);
+            # events.jsonl ainda preserva stderr_tail para diagnóstico real.
+            session = FFmpegSession(
                 cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                label=f"capture_{platform}_{self._clean_name(ch)[:24]}",
+                capture_stdout=False,
+                quiet=True,
             )
+            session.start()
 
-            # atexit já registrado no __init__ — usa self.current_process atualizado
-
-            # Só atualiza o estado após Popen bem-sucedido
-            self.current_process = proc
+            # Só atualiza o estado após start() bem-sucedido
+            self.current_session = session
+            self.current_process = session.proc   # mantido para compat com kill_tree legado
             self.current_file    = out_file
             self.start_time      = time.time()
             self.is_recording    = True
@@ -222,19 +254,21 @@ class StreamCapture:
 
             logger.info("⏹ Parando gravação...")
             try:
-                _kill_proc(self.current_process, timeout=5.0)
+                if self.current_session is not None:
+                    self.current_session.close(grace=5.0)
+                else:
+                    _kill_proc(self.current_process, timeout=5.0)
             except KeyboardInterrupt:
-                # Força kill imediato se Ctrl+C durante o wait
-                try:
-                    self.current_process.kill()
-                except Exception:
-                    pass
+                # Ctrl+C durante o wait → força kill imediato via kill_tree
+                kill_tree(self.current_process, grace=0.5)
 
             self.is_recording    = False
             file                 = self.current_file
             self.current_file    = None
+            self.current_session = None
             self.current_process = None
             self.start_time      = None
+            self._unregister()
             logger.info("✅ Gravação encerrada.")
             return file
 
@@ -259,10 +293,11 @@ class StreamCapture:
             "-c:a", "copy",
             str(output_path),
         ]
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
-        if result.returncode != 0:
+        result = run_ffmpeg(cmd, label="extract_segment", timeout=120)
+        if not result.ok:
+            tail = "\n".join(result.stderr_tail[-30:])
             raise RuntimeError(
-                f"ffmpeg recorte falhou:\n{result.stderr.decode(errors='replace')}"
+                f"ffmpeg recorte falhou rc={result.returncode}:\n{tail}"
             )
         logger.info(f"✂️  Segmento salvo: {output_path}")
         return output_path

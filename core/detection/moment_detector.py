@@ -14,6 +14,9 @@ Garantias de concorrência:
 
 import time
 import queue
+import random
+import socket
+import ssl
 import struct
 import atexit
 import hashlib
@@ -23,6 +26,15 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional, Callable
 from pathlib import Path
+
+from ffmpeg_runner import FFmpegSession
+
+# Telemetria: import lazy/tolerante
+try:
+    from metrics import incr as _metrics_incr, observe as _metrics_observe
+except ImportError:
+    def _metrics_incr(*_a, **_k): pass
+    def _metrics_observe(*_a, **_k): pass
 
 logger = logging.getLogger("ClipBot.Detection")
 
@@ -96,6 +108,10 @@ class AudioSpikeDetector:
     Cross-platform (Windows/Linux/macOS): não usa select() em file descriptors.
     Se nenhum chunk chegar em IO_STALL_SEC → mata FFmpeg, drena fila,
     aguarda join da thread leitora e reinicia tudo do seek_sec atual.
+
+    Bound de memória: get_moments_snapshot poda momentos com end_sec antigo
+    (default: 5 min antes do elapsed atual). Lista cresceria sem bound em
+    sessões longas (~1 spike/min × 24h = 1440 entries).
     """
 
     SAMPLE_RATE    = 22050
@@ -104,6 +120,7 @@ class AudioSpikeDetector:
     BASELINE_WIN   = 60
     IO_STALL_SEC   = 5.0   # tempo máximo sem chunk → reinicia
     QUEUE_POLL_SEC = 1.0   # timeout de cada get() na fila
+    MOMENT_TTL_SEC = 300.0 # 5min: poda momentos com end_sec antes desse limiar
 
     def __init__(self, config: dict, elapsed_fn: Callable[[], float]):
         self.cfg        = config["detection"]["audio_spike"]
@@ -112,20 +129,39 @@ class AudioSpikeDetector:
         self._lock      = threading.Lock()
         self._running   = False
         self._thread:   Optional[threading.Thread] = None
-        self._proc      = None
+        self._proc      = None              # alias do session.proc — usado por _pipe_reader
+        self._session: Optional[FFmpegSession] = None
 
-        # Registra atexit UMA única vez, apontando para self._proc
+        # Registra atexit UMA única vez, apontando para o estado mutável
         atexit.register(self._atexit_cleanup)
 
     def _atexit_cleanup(self) -> None:
-        """Chamado via atexit: mata o proc atual (se houver)."""
-        _kill_proc(self._proc)
+        """Chamado via atexit: encerra session/proc atual (se houver)."""
+        if self._session is not None:
+            try:
+                self._session.close()
+            except Exception:
+                _kill_proc(self._proc)
+        else:
+            _kill_proc(self._proc)
 
     # ── API pública ───────────────────────────────────────────────────────────
 
     def get_moments_snapshot(self) -> List[Moment]:
-        """Retorna cópia thread-safe da lista de momentos."""
+        """
+        Retorna cópia thread-safe da lista de momentos.
+        Aplica poda lazy: descarta momentos com end_sec < (elapsed - TTL).
+        """
+        try:
+            cutoff = self.elapsed_fn() - self.MOMENT_TTL_SEC
+        except Exception:
+            cutoff = -1.0
         with self._lock:
+            if cutoff > 0 and self._moments:
+                # Limpa em-place se houver muitos antigos (>10 ou >25% do total)
+                old_count = sum(1 for m in self._moments if m.end_sec < cutoff)
+                if old_count > 10 or (old_count > 0 and old_count * 4 > len(self._moments)):
+                    self._moments = [m for m in self._moments if m.end_sec >= cutoff]
             return list(self._moments)
 
     def start(self, stream_file: Path) -> None:
@@ -148,6 +184,9 @@ class AudioSpikeDetector:
         """
         Roda em daemon thread. Lê CHUNK_BYTES do stdout do FFmpeg e empurra
         na fila. Ao encerrar (EOF, erro ou stop_flag), empurra _PIPE_EOF.
+
+        Com maxsize na queue: put pode bloquear → loop com timeout check stop_flag,
+        evita deadlock em shutdown enquanto consumer está travado.
         """
         try:
             while not stop_flag.is_set():
@@ -155,19 +194,33 @@ class AudioSpikeDetector:
                     data = proc.stdout.read(chunk_bytes)
                 except Exception:
                     break
-                chunk_queue.put(data if data else _PIPE_EOF)
                 if not data:
                     break
+                # put com timeout para checar stop_flag periodicamente
+                while not stop_flag.is_set():
+                    try:
+                        chunk_queue.put(data, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
         except Exception:
             pass
         finally:
-            chunk_queue.put(_PIPE_EOF)   # garante que o loop principal desbloqueia
+            # Sentinel EOF — best effort sem bloquear
+            try:
+                chunk_queue.put_nowait(_PIPE_EOF)
+            except queue.Full:
+                # Queue cheia: drena 1 entry para abrir espaço para sentinel
+                try:
+                    chunk_queue.get_nowait()
+                    chunk_queue.put_nowait(_PIPE_EOF)
+                except (queue.Empty, queue.Full):
+                    pass
 
     # ── Loop principal ────────────────────────────────────────────────────────
 
     def _monitor_loop(self, stream_file: Path) -> None:
         import numpy as np
-        import subprocess as sp
 
         # Aguarda o arquivo ter dados suficientes
         logger.info("🔊 Aguardando stream acumular dados...")
@@ -185,7 +238,9 @@ class AudioSpikeDetector:
         last_spike_sec: float  = -999.0
         seek_sec:       float  = 0.0
 
-        chunk_queue:    queue.Queue             = queue.Queue()
+        # maxsize=120: ~2min de buffer (1 chunk = 1s). Reader bloqueia em put()
+        # quando cheio → backpressure correto. Sem maxsize, OOM em 30min de stall.
+        chunk_queue:    queue.Queue             = queue.Queue(maxsize=120)
         reader_thread:  Optional[threading.Thread] = None
         reader_stop:    Optional[threading.Event]  = None
 
@@ -208,6 +263,7 @@ class AudioSpikeDetector:
                 reader_thread = None
 
             # ── 2. Inicia novo processo FFmpeg + thread leitora ───────────────
+            session = None
             proc = None
             reader_stop = threading.Event()
             try:
@@ -221,9 +277,16 @@ class AudioSpikeDetector:
                     "-f",  "f32le",
                     "pipe:1",
                 ]
-                proc        = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.DEVNULL)
+                # Long-running session reciclada a cada ~3s: quiet=True para
+                # evitar inundar o log do usuário (start/end OK ficam em DEBUG).
+                # Erros/warnings continuam visíveis.
+                session = FFmpegSession(
+                    cmd, label="audio_spike", capture_stdout=True, quiet=True,
+                )
+                session.start()
+                proc        = session.proc
+                self._session = session
                 self._proc  = proc
-                # atexit já registrado no __init__ — usa self._proc atualizado
 
                 reader_thread = threading.Thread(
                     target=AudioSpikeDetector._pipe_reader,
@@ -288,6 +351,8 @@ class AudioSpikeDetector:
                         )
                         with self._lock:
                             self._moments.append(m)
+                        _metrics_incr("audio.spike_detected")
+                        _metrics_observe("audio.spike_db", round(spike_db, 1))
                         logger.info(
                             f"🎯 Pico de áudio em {current_sec:.1f}s "
                             f"({spike_db:+.1f} dB acima da média)"
@@ -296,10 +361,18 @@ class AudioSpikeDetector:
             except Exception as e:
                 logger.debug(f"Audio loop erro: {e}")
             finally:
-                # Sinaliza leitora e mata o proc; join feito no início do próximo ciclo
+                # Sinaliza leitora e encerra session; join da reader_thread no
+                # início do próximo ciclo. session.close() drena stderr ring + log.
                 if reader_stop:
                     reader_stop.set()
-                _kill_proc(proc)
+                if session is not None:
+                    try:
+                        session.close()
+                    except Exception:
+                        _kill_proc(proc)
+                else:
+                    _kill_proc(proc)
+                self._session = None
                 self._proc = None
 
             if self._running:
@@ -322,24 +395,81 @@ class AudioSpikeDetector:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TwitchChatDetector:
-    """Chat Twitch via IRC — flood e keywords. Thread-safe via _lock privado."""
+    """
+    Chat Twitch via IRC — flood e keywords. Thread-safe via _lock privado.
+
+    Reconnect:
+      • Loop iterativo (sem recursão — stack constante, seguro 24/7).
+      • Backoff exponencial 5→10→20→40→…→300s, com jitter ±25%.
+      • Counter reseta após sessão estável (>60s conectado).
+      • Shutdown imediato via threading.Event + sock.shutdown() para acordar recv.
+    """
+
+    # Servers, em ordem de preferência. (host, port, use_ssl)
+    _SERVERS = (
+        ("irc.chat.twitch.tv", 6697, True),
+        ("irc.chat.twitch.tv", 6667, False),
+    )
+
+    # Backoff
+    _BACKOFF_BASE_SEC      = 5.0
+    _BACKOFF_CAP_SEC       = 300.0     # 5 min
+    _BACKOFF_JITTER_FRAC   = 0.25      # ±25%
+    _STABLE_SESSION_SEC    = 60.0      # connection ≥ 60s reseta backoff
+    _MSG_TIMES_MAXLEN      = 2000      # bound contra burst absurdo
+    _MOMENT_TTL_SEC        = 300.0     # poda momentos com end_sec < elapsed-300s
+
+    # Socket timeouts
+    _CONNECT_TIMEOUT_SEC   = 10.0
+    _RECV_TIMEOUT_SEC      = 5.0       # também é granularidade de shutdown check
+
+    @staticmethod
+    def _sanitize_channel(raw: str) -> str:
+        """
+        Aceita 'baiano', 'https://www.twitch.tv/baiano', '@baiano', etc.
+        Retorna nome limpo: 'baiano'.
+        Crítico: IRC JOIN com URL completa silenciosamente é ignorado pela Twitch.
+        """
+        s = (raw or "").strip().rstrip("/")
+        for prefix in (
+            "https://www.twitch.tv/", "http://www.twitch.tv/",
+            "https://twitch.tv/",     "http://twitch.tv/",
+            "www.twitch.tv/",         "twitch.tv/",
+        ):
+            if s.lower().startswith(prefix):
+                s = s[len(prefix):]
+                break
+        s = s.lstrip("@").lstrip("#")
+        # Remove query/fragment se houver
+        for sep in ("?", "#", "/"):
+            if sep in s:
+                s = s.split(sep, 1)[0]
+        return s.strip()
 
     def __init__(self, config: dict, elapsed_fn: Callable[[], float]):
         self.cfg_flood  = config["detection"]["chat_flood"]
         self.cfg_kw     = config["detection"]["keywords"]
         self.keywords   = [k.lower() for k in self.cfg_kw.get("words", [])]
         self.elapsed_fn = elapsed_fn
-        self.channel    = (
+        raw_channel    = (
             config["streams"]["twitch"].get("channel") or
             (config["streams"]["twitch"].get("channels") or [""])[0]
         )
+        self.channel = self._sanitize_channel(raw_channel)
         self._moments:   List[Moment] = []
         self._lock       = threading.Lock()
-        self._msg_times: deque = deque()
+        # bound contra burst extremo (cleanup janela ainda roda em _process_message)
+        self._msg_times: deque = deque(maxlen=self._MSG_TIMES_MAXLEN)
         self._kw_times:  deque = deque()
-        self._running    = False
-        self._baseline_rate: float = 0.0   # média histórica de msgs/s
-        self._rate_samples: deque = deque(maxlen=60)  # últimas 60 amostras de rate
+        self._baseline_rate: float = 0.0
+        self._rate_samples: deque = deque(maxlen=60)
+
+        # Lifecycle
+        self._stop_event: threading.Event = threading.Event()
+        self._thread:     Optional[threading.Thread] = None
+        # Socket atual (para shutdown externo acordar recv). Acesso sob _sock_lock.
+        self._sock:       Optional[socket.socket] = None
+        self._sock_lock:  threading.Lock = threading.Lock()
 
     @property
     def chat_rate(self) -> float:
@@ -359,95 +489,243 @@ class TwitchChatDetector:
         return self.chat_rate / self._baseline_rate
 
     def get_moments_snapshot(self) -> List[Moment]:
+        """Snapshot com poda lazy de momentos antigos (TTL=5min)."""
+        try:
+            cutoff = self.elapsed_fn() - self._MOMENT_TTL_SEC
+        except Exception:
+            cutoff = -1.0
         with self._lock:
+            if cutoff > 0 and self._moments:
+                old_count = sum(1 for m in self._moments if m.end_sec < cutoff)
+                if old_count > 10 or (old_count > 0 and old_count * 4 > len(self._moments)):
+                    self._moments = [m for m in self._moments if m.end_sec >= cutoff]
             return list(self._moments)
 
     def start(self) -> None:
-        self._running = True
-        threading.Thread(target=self._connect_loop, daemon=True).start()
-        logger.info("💬 TwitchChatDetector iniciado")
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._connect_loop, name="TwitchIRC", daemon=True,
+        )
+        self._thread.start()
+        logger.info("[IRC] detector started")
 
     def stop(self) -> None:
-        self._running = False
+        """
+        Sinaliza shutdown e desbloqueia recv via socket.shutdown.
+        Não faz join — caller pode aguardar self._thread.join() se quiser.
+        """
+        self._stop_event.set()
+        # Acorda recv pendente fechando socket assistido
+        with self._sock_lock:
+            sock = self._sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                # SSL socket pode levantar em shutdown; fechar como fallback
+                try: sock.close()
+                except Exception: pass
 
-    def _connect_loop(self) -> None:
-        import socket, ssl
+    # ── Helpers ──────────────────────────────────────────────────────────────
 
+    def _backoff_delay(self, attempt: int) -> float:
+        """Exponential backoff capped + jitter ±25%."""
+        base = self._BACKOFF_BASE_SEC * (2 ** max(0, attempt - 1))
+        base = min(base, self._BACKOFF_CAP_SEC)
+        jitter = base * self._BACKOFF_JITTER_FRAC
+        return max(0.5, base + random.uniform(-jitter, jitter))
+
+    def _close_sock(self, sock: Optional[socket.socket]) -> None:
+        """Close idempotente. Limpa self._sock se for o atual."""
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except Exception:
+            pass
+        with self._sock_lock:
+            if self._sock is sock:
+                self._sock = None
+
+    def _try_connect(self) -> Optional[socket.socket]:
+        """Tenta cada servidor em ordem. Retorna socket conectado e JOINed, ou None."""
         nick    = "justinfan12345"
         channel = f"#{self.channel.lower().strip()}"
 
-        connections = [
-            ("irc.chat.twitch.tv", 6697, True),
-            ("irc.chat.twitch.tv", 6667, False),
-        ]
-
-        sock = None
-        for server, port, use_ssl in connections:
+        for server, port, use_ssl in self._SERVERS:
+            if self._stop_event.is_set():
+                return None
+            raw: Optional[socket.socket] = None
+            sock: Optional[socket.socket] = None
+            t0 = time.monotonic()
             try:
                 raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                raw.settimeout(10)
+                raw.settimeout(self._CONNECT_TIMEOUT_SEC)
                 if use_ssl:
                     ctx = ssl.create_default_context()
                     sock = ctx.wrap_socket(raw, server_hostname=server)
                 else:
                     sock = raw
                 sock.connect((server, port))
-                logger.info(f"💬 Chat conectado: {server}:{port} (SSL={use_ssl})")
-                break
+                # IRC handshake
+                sock.send(f"NICK {nick}\r\n".encode())
+                sock.send(f"USER {nick} 8 * :{nick}\r\n".encode())
+                sock.send(f"JOIN {channel}\r\n".encode())
+                sock.settimeout(self._RECV_TIMEOUT_SEC)
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    f"[IRC] connected to {server}:{port} ssl={use_ssl} "
+                    f"channel={channel} ({elapsed:.2f}s)"
+                )
+                # Publica para shutdown externo
+                with self._sock_lock:
+                    self._sock = sock
+                return sock
             except Exception as e:
-                logger.debug(f"Chat {server}:{port} falhou: {e}")
-                sock = None
+                logger.warning(
+                    f"[IRC] connect {server}:{port} failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+                # Cleanup explícito de raw e sock — evita leak de socket pré-wrap
+                if sock is not None and sock is not raw:
+                    try: sock.close()
+                    except Exception: pass
+                if raw is not None:
+                    try: raw.close()
+                    except Exception: pass
+        return None
 
-        if not sock:
-            logger.error("❌ Chat IRC: sem conexão. Keywords desativadas.")
-            return
+    def _listen(self, sock: socket.socket) -> str:
+        """
+        Loop de leitura. Retorna razão de saída ('eof', 'shutdown', 'recv_error', 'send_error').
+        Buffer interno garante que linhas cortadas entre recvs sejam processadas inteiras.
+        """
+        channel = f"#{self.channel.lower().strip()}"
+        buf = bytearray()
+        msg_count = 0
 
-        try:
-            sock.send(f"NICK {nick}\r\n".encode())
-            sock.send(f"USER {nick} 8 * :{nick}\r\n".encode())
-            sock.send(f"JOIN {channel}\r\n".encode())
-            sock.settimeout(5)
-            logger.info(f"💬 Entrando: {channel}")
-
-            msg_count = 0
-            while self._running:
-                try:
-                    data = sock.recv(4096).decode("utf-8", errors="ignore")
-                    if not data:
-                        break
-                    if "PING" in data:
-                        sock.send("PONG :tmi.twitch.tv\r\n".encode())
-                    for line in data.split("\r\n"):
-                        if "PRIVMSG" in line:
-                            msg_count += 1
-                            msg = line.split("PRIVMSG", 1)[-1].split(":", 1)[-1].strip()
-                            if msg_count <= 3 or msg_count % 50 == 0:
-                                logger.debug(f"💬 [{msg_count}]: {msg[:60]}")
-                            self._process_message(msg.lower())
-                        elif "366" in line:
-                            logger.info(f"✅ Chat: canal {channel} conectado!")
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    logger.debug(f"Chat recv: {e}")
-                    break
-        except Exception as e:
-            logger.error(f"Chat IRC erro: {e}")
-        finally:
+        while not self._stop_event.is_set():
             try:
-                sock.close()
-            except Exception:
-                pass
-            if self._running:
-                logger.warning("💬 Chat desconectado. Reconectando em 10s...")
-                time.sleep(10)
-                self._connect_loop()
+                data = sock.recv(4096)
+            except socket.timeout:
+                continue
+            except (OSError, ssl.SSLError) as e:
+                logger.debug(f"[IRC] recv error: {type(e).__name__}: {e}")
+                return "recv_error"
+
+            if not data:
+                return "eof"
+
+            buf.extend(data)
+            # Processa apenas linhas completas (\r\n). Resto fica no buffer.
+            while True:
+                idx = buf.find(b"\r\n")
+                if idx < 0:
+                    break
+                line_bytes = bytes(buf[:idx])
+                del buf[:idx + 2]
+                try:
+                    line = line_bytes.decode("utf-8", errors="ignore")
+                except Exception:
+                    continue
+                if not line:
+                    continue
+
+                # PING/PONG correto: linha começa com "PING " (não substring em payload)
+                if line.startswith("PING "):
+                    try:
+                        sock.send(b"PONG :tmi.twitch.tv\r\n")
+                    except Exception as e:
+                        logger.debug(f"[IRC] PONG send failed: {e}")
+                        return "send_error"
+                    continue
+
+                # Numeric reply 366 (RPL_ENDOFNAMES) — deve vir após o nick, não substring
+                if " 366 " in line:
+                    logger.info(f"[IRC] joined {channel}")
+                    continue
+
+                if "PRIVMSG" in line:
+                    msg_count += 1
+                    msg = line.split("PRIVMSG", 1)[-1].split(":", 1)[-1].strip()
+                    if msg_count <= 3 or msg_count % 50 == 0:
+                        logger.debug(f"[IRC] msg#{msg_count}: {msg[:60]}")
+                    self._process_message(msg.lower())
+
+            # Bound do buffer contra payload patológico sem \r\n
+            if len(buf) > 64 * 1024:
+                logger.warning("[IRC] recv buffer >64KB without delimiter — discarding")
+                buf.clear()
+
+        return "shutdown"
+
+    def _connect_loop(self) -> None:
+        """
+        Loop iterativo. Stack constante.
+        Backoff entre conexões; reseta após sessão estável (>60s).
+        """
+        attempt = 0
+        while not self._stop_event.is_set():
+            sock = self._try_connect()
+            if sock is None:
+                if self._stop_event.is_set():
+                    break
+                attempt += 1
+                _metrics_incr("irc.connect_failed")
+                delay = self._backoff_delay(attempt)
+                logger.warning(
+                    f"[IRC] all servers failed (attempt {attempt}), "
+                    f"retry in {delay:.1f}s"
+                )
+                if self._stop_event.wait(timeout=delay):
+                    break
+                continue
+
+            # Sessão estabelecida
+            session_start = time.monotonic()
+            reason = "unknown"
+            try:
+                reason = self._listen(sock)
+            except Exception as e:
+                logger.error(
+                    f"[IRC] listen crashed: {type(e).__name__}: {e}"
+                )
+                reason = "exception"
+            finally:
+                self._close_sock(sock)
+
+            elapsed = time.monotonic() - session_start
+            _metrics_observe("irc.session_duration_sec", round(elapsed, 1))
+            _metrics_incr("irc.disconnected", reason=reason)
+            if elapsed >= self._STABLE_SESSION_SEC:
+                # Sessão considerada estável → reset backoff
+                if attempt > 0:
+                    logger.info(f"[IRC] resetting backoff after stable session ({elapsed:.0f}s)")
+                attempt = 0
+            else:
+                attempt += 1
+
+            if self._stop_event.is_set():
+                break
+
+            delay = self._backoff_delay(attempt)
+            logger.info(
+                f"[IRC] disconnected reason={reason} alive={elapsed:.1f}s "
+                f"reconnect in {delay:.1f}s (attempt {attempt})"
+            )
+            if self._stop_event.wait(timeout=delay):
+                break
+
+        logger.info("[IRC] connect loop exited")
 
     def _process_message(self, msg: str) -> None:
         now   = time.time()
         csec  = self.elapsed_fn()
         win_f = self.cfg_flood["window_seconds"]
         win_k = 5
+        _metrics_incr("chat.msg_received")
 
         self._msg_times.append(now)
         while self._msg_times and now - self._msg_times[0] > win_f:
@@ -459,6 +737,7 @@ class TwitchChatDetector:
         if len(self._rate_samples) >= 5:
             self._baseline_rate = sum(self._rate_samples) / len(self._rate_samples)
         if rate >= self.cfg_flood["messages_per_second"]:
+            _metrics_incr("chat.flood_detected")
             self._add_moment("chat_flood", csec,
                              self.cfg_flood["buffer_before"],
                              self.cfg_flood["buffer_after"],
@@ -466,6 +745,7 @@ class TwitchChatDetector:
 
         found = [k for k in self.keywords if k in msg]
         if found:
+            _metrics_incr("chat.keyword_detected")
             logger.info(f"🔑 Keyword: {found} | {msg[:60]}")
             self._kw_times.append((now, found))
             while self._kw_times and now - self._kw_times[0][0] > win_k:

@@ -142,15 +142,37 @@ class PendingStore:
     # ── Persistência ──────────────────────────────────────────────────────────
 
     def _save_locked(self) -> None:
-        """Salva no disco. DEVE ser chamado DENTRO do lock."""
+        """
+        Salva no disco atomicamente. DEVE ser chamado DENTRO do lock.
+
+        Atomicidade: escreve em arquivo .tmp e faz os.replace (rename atômico no
+        Windows desde Python 3.3+). Crash no meio do write não corrompe o
+        pending.json original — perde-se apenas a última mutação.
+        """
         try:
             APP_DATA.mkdir(parents=True, exist_ok=True)
-            PENDING_FILE.write_text(
-                json.dumps(list(self._data.values()), indent=2, ensure_ascii=False),
-                encoding="utf-8",
+            tmp_path = PENDING_FILE.with_suffix(".json.tmp")
+            payload = json.dumps(
+                list(self._data.values()), indent=2, ensure_ascii=False
             )
+            # Escreve em .tmp + flush/fsync antes de renomear
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    # Alguns FS (network drives, FAT32) não suportam fsync
+                    pass
+            # Rename atômico (substitui pending.json antigo)
+            os.replace(tmp_path, PENDING_FILE)
         except Exception as ex:
             logger.warning(f"pending.json save falhou: {ex}")
+            # Cleanup do .tmp em caso de falha
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def _load(self) -> None:
         """Carrega do disco na inicialização. Descarta entradas sem raw_file."""

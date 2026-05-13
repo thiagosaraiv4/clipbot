@@ -10,6 +10,7 @@ Mudanças v2.4:
   • _monitor_platform: try/finally já presente — mantido; logging melhorado.
 """
 
+import os
 import sys
 import json
 import time
@@ -23,6 +24,12 @@ from datetime import datetime
 _BASE = Path(__file__).parent
 _CORE = _BASE / "core"
 sys.path.insert(0, str(_CORE))
+
+# Telemetria — import lazy via try/except para tolerância em PR1.5
+try:
+    from metrics import incr as _metrics_incr
+except ImportError:
+    def _metrics_incr(*_args, **_kw): pass
 # Note: stream_capture.py lives directly in core/ (already on sys.path above)
 sys.path.insert(0, str(_CORE / "detection"))
 sys.path.insert(0, str(_CORE / "editing"))
@@ -267,7 +274,7 @@ class BotEngine:
                     "credentials_file":     (
                         creds.get("youtube_credentials_path") or
                         upl.get("youtube", {}).get("credentials_path") or
-                        str(Path.home() / "AppData" / "Roaming" / "ClipBot" / "youtube_credentials.json")
+                        str(Path(os.environ.get("APPDATA", Path.home())) / "ClipBot" / "youtube_credentials.json")
                     ),
                     "default_title":        "🔥 CLIP INSANO da Live!",
                     "default_description":  "Melhor momento da live!",
@@ -294,6 +301,54 @@ class BotEngine:
     # ──────────────────────────────────────────────────────────────────────────
     # Garbage collection de disco (raw_*.ts e clips antigos)
     # ──────────────────────────────────────────────────────────────────────────
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Disk monitor (warn em <5GB, halt em <1GB)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    _DISK_WARN_GB = 5.0
+    _DISK_HALT_GB = 1.0
+    _DISK_CHECK_INTERVAL_SEC = 60.0
+
+    def _disk_monitor_loop(self, clips_dir: Path) -> None:
+        """
+        Roda em thread daemon paralela. A cada 60s checa o disco do clips_dir.
+        Em <5GB livre: warn (1× por estado).
+        Em <1GB livre: warn final + set _stop_event para parar engine.
+        """
+        import shutil
+        last_state = "ok"  # ok | warn | halt
+        while not self._stop_event.is_set():
+            try:
+                free_gb = shutil.disk_usage(str(clips_dir)).free / 1e9
+                if free_gb < self._DISK_HALT_GB:
+                    if last_state != "halt":
+                        logger.error(
+                            f"🛑 Disk crítico: {free_gb:.2f}GB livres em {clips_dir} "
+                            "— parando engine."
+                        )
+                        last_state = "halt"
+                    self._stop_event.set()
+                    return
+                elif free_gb < self._DISK_WARN_GB:
+                    if last_state != "warn":
+                        logger.warning(
+                            f"⚠️  Disk baixo: {free_gb:.2f}GB livres em {clips_dir} "
+                            f"(threshold {self._DISK_WARN_GB:.0f}GB). "
+                            "Pretende reduzir tempo de live ou limpar clips."
+                        )
+                        last_state = "warn"
+                else:
+                    if last_state != "ok":
+                        logger.info(
+                            f"✅ Disk OK: {free_gb:.2f}GB livres (recuperado)"
+                        )
+                        last_state = "ok"
+            except Exception as e:
+                logger.debug(f"disk_monitor: {e}")
+            # Sleep interruptível (acorda em stop)
+            if self._stop_event.wait(timeout=self._DISK_CHECK_INTERVAL_SEC):
+                break
 
     def _garbage_collect_disk(self, clips_dir: Path, output_dir: Path) -> None:
         """
@@ -412,6 +467,15 @@ class BotEngine:
             + ", ".join(f"{p}:{c}" for p, c in active)
         )
 
+        # Disk monitor — para detectar disk-fill em sessão longa
+        disk_thread = threading.Thread(
+            target=self._disk_monitor_loop,
+            args=(clips_dir,),
+            name="disk-monitor",
+            daemon=True,
+        )
+        disk_thread.start()
+
         threads = []
         for plat, channel in active:
             t = threading.Thread(
@@ -484,8 +548,9 @@ class BotEngine:
         clean    = self._clean_channel_name(channel)
         label    = f"{platform.upper()}:{clean}"
         capture  = StreamCapture(cfg, str(clips_dir))
-        processed: set = set()
-        last_clip_time: float = 0.0   # timestamp do último clip gerado
+        processed: dict = {}          # key → timestamp (para poda periódica)
+        last_clip_time: float = 0.0
+        _PRUNE_AGE = 3600.0           # descarta entradas com >1h
 
         try:
             raw_file = capture.start_recording(platform)
@@ -507,6 +572,12 @@ class BotEngine:
 
                 moments = detector.all_moments
 
+                # Poda periódica do dict processed (>1h)
+                now_ts = time.time()
+                if len(processed) > 500:
+                    processed = {k: t for k, t in processed.items()
+                                 if now_ts - t < _PRUNE_AGE}
+
                 # ── Modo aprovação: enfileira para revisão da UI ───────────────
                 if approval_mode:
                     candidates = []
@@ -521,7 +592,7 @@ class BotEngine:
                     # Ordena por score desc e toma top N por ciclo
                     candidates.sort(key=lambda x: x[1].score, reverse=True)
                     for key, m in candidates[:approval_top_n]:
-                        processed.add(key)
+                        processed[key] = now_ts
                         logger.info(
                             f"📋 [{label}] [{m.reason}] "
                             f"{m.start_sec:.1f}s→{m.end_sec:.1f}s  "
@@ -557,7 +628,7 @@ class BotEngine:
                     if capture.get_elapsed_seconds() < m.end_sec + 2:
                         continue
 
-                    processed.add(key)
+                    processed[key] = now_ts
                     logger.info(
                         f"🎯 [{label}] [{m.reason}] "
                         f"{m.start_sec:.1f}s → {m.end_sec:.1f}s  score={m.score:.2f}"
@@ -637,6 +708,7 @@ class BotEngine:
                                 )
                                 if not passed:
                                     logger.warning(f"\U0001f6ab [{label}] QualityGate: {qg_reason} \u2014 SKIP")
+                                    _metrics_incr("engine.quality_gate_failed", platform=platform)
                                     raw_clip.unlink(missing_ok=True)
                                     continue
 
@@ -694,6 +766,12 @@ class BotEngine:
                                     all_results["youtube"] = uploader.youtube.upload(
                                         edited, title, caption)
 
+                                _metrics_incr(
+                                    "engine.upload_attempt",
+                                    platform=upload_plat,
+                                    ok=str(bool(all_results.get(upload_plat))),
+                                )
+
                                 delay = config["upload"]["delay_between_posts"]
                                 if all_results.get(upload_plat) and delay > 0:
                                     logger.info(f"⏳ Delay {delay}s entre uploads...")
@@ -702,6 +780,8 @@ class BotEngine:
                             except Exception as e:
                                 logger.error(f"❌ Upload {upload_plat}: {e}")
                                 all_results[upload_plat] = False
+                                _metrics_incr("engine.upload_exception",
+                                              platform=upload_plat)
 
                         ok = [p for p, v in all_results.items() if v]
 
