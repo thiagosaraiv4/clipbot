@@ -284,7 +284,7 @@ class TitleGenerator:
     def generate(self, raw_clip: Path, moment_entry: dict) -> str:
         """
         Gera título para o banner do clip.
-        Cascata: Whisper → Templates → Fallback.
+        Cascata: LLM Hook Scorer → Whisper → Templates → Fallback.
 
         Args:
             raw_clip: Path do arquivo de vídeo raw
@@ -296,8 +296,45 @@ class TitleGenerator:
         reason   = moment_entry.get("reason", "audio_spike")
         keywords = moment_entry.get("keywords", [])
         extra    = moment_entry.get("extra", {})
+        channel  = moment_entry.get("channel", "")
 
-        # ── Estratégia A: Whisper ──────────────────────────────────────
+        # ── Estratégia 0: LLM Hook Scorer (Iter2 PR3) ─────────────────
+        # Acima do Whisper micro: usa transcrição completa + contexto editorial.
+        # Sem API key configurada → is_available()=False, cai para próximo.
+        try:
+            from hook_scorer import HookScorer
+            if HookScorer.is_available() and self.use_whisper and raw_clip.exists():
+                # Reusa Whisper singleton para obter transcrição (já carregado por
+                # video_editor neste ponto do pipeline; warm ~2s).
+                from whisper_service import WhisperService
+                svc = WhisperService.get("small", "auto")
+                # Transcreve só os primeiros 8s (suficiente p/ hook editorial)
+                tmp_audio = self._extract_short_audio(raw_clip, duration=8.0)
+                if tmp_audio:
+                    try:
+                        result = svc.transcribe(
+                            tmp_audio, language=self.language,
+                            word_timestamps=False, beam_size=1,
+                        )
+                        transcription = (result.get("text") or "").strip()
+                    finally:
+                        try: tmp_audio.unlink(missing_ok=True)
+                        except Exception: pass
+                    scorer = HookScorer(language=self.language)
+                    extra_reasons = (extra or {}).get("reasons", [])
+                    score_result = scorer.score(
+                        transcription, reason, channel=channel,
+                        extra_reasons=extra_reasons,
+                    )
+                    if score_result and score_result.get("title"):
+                        llm_title = score_result["title"]
+                        logger.info(f"✨ Título via LLM: \"{llm_title}\" "
+                                    f"(viral={score_result['viral_score']:.2f})")
+                        return llm_title
+        except Exception as e:
+            logger.debug(f"LLM hook scorer falhou: {e}")
+
+        # ── Estratégia A: Whisper micro ────────────────────────────────
         if self.use_whisper and raw_clip.exists():
             try:
                 whisper_title = self._whisper_micro(raw_clip)
