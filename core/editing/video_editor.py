@@ -130,9 +130,12 @@ class VideoEditor:
             # device="auto": tenta CUDA INT8_FP16 → CPU INT8 → openai-whisper CPU
             service = WhisperService.get(size="small", device="auto")
             with _Timer("editor.whisper", backend=service.backend or "unknown"):
+                # word_timestamps=True: necessário para karaoke ASS (Iter2 PR2).
+                # Custo extra ~8× no transcribe mas é único hit por clip.
+                # Para SRT plano, defaults seriam beam_size=1, word_timestamps=False.
                 result = service.transcribe(
                     video_path, language=language,
-                    word_timestamps=False, beam_size=1,
+                    word_timestamps=True, beam_size=1,
                 )
             logger.info("✅ Transcrição concluída.")
             return result["segments"]
@@ -181,6 +184,125 @@ class VideoEditor:
         sc = int(s % 60)
         ms = int((s % 1) * 1000)
         return f"{h:02d}:{m:02d}:{sc:02d},{ms:03d}"
+
+    # ------------------------------------------------------------------
+    # ASS karaoke subtitles (Iter2 PR2 — estilo TikTok/CapCut)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _seconds_to_ass_time(s: float) -> str:
+        """ASS format: H:MM:SS.cc (centissegundos, single digit hour)."""
+        if s < 0: s = 0.0
+        h  = int(s // 3600)
+        m  = int((s % 3600) // 60)
+        sc = s % 60
+        return f"{h}:{m:02d}:{sc:05.2f}"
+
+    @staticmethod
+    def _escape_ass_text(text: str) -> str:
+        """Escape de caracteres especiais ASS — `{`, `}`, `\\`, newline."""
+        text = text.replace("\\", "\\\\")
+        text = text.replace("{", "\\{").replace("}", "\\}")
+        text = text.replace("\n", "\\N").replace("\r", "")
+        return text
+
+    def _build_ass_header(self) -> str:
+        """
+        Header ASS estilo CapCut/TikTok 2024:
+          • PlayRes 1080×1920 (combina com output vertical do ClipBot).
+          • Fonte: Impact (impacto bold) com fallback Arial Black.
+          • Tamanho ~h/22 (mesma escala do title banner).
+          • Branco com outline preto grosso (legível em qualquer background).
+          • PrimaryColour = amarelo: palavras "já faladas" ficam amarelas via \\k.
+          • SecondaryColour = branco: palavras "futuras" começam brancas.
+          • Alignment 2 = bottom-center. MarginV=240 = safe zone TikTok bottom.
+        """
+        cfg_sub = self.cfg.get("subtitles", {})
+        layout  = self.cfg.get("layout_preset", "tiktok")
+        _preset_margins = {"tiktok": 240, "shorts": 220, "reels": 230}
+        margin_v = cfg_sub.get("margin_v") or _preset_margins.get(layout, 240)
+
+        # FontSize em ASS: unidade depende de PlayResY. Para 1920 vertical,
+        # fontsize 78 ≈ 78/1920 ≈ 4% da altura = ~h/24. Estilo balanced.
+        font_size = 78
+
+        return (
+            "[Script Info]\n"
+            "ScriptType: v4.00+\n"
+            "PlayResX: 1080\n"
+            "PlayResY: 1920\n"
+            "ScaledBorderAndShadow: yes\n"
+            "WrapStyle: 2\n"
+            "\n"
+            "[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+            "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            # PrimaryColour = amarelo (palavras já faladas/atuais)
+            # SecondaryColour = branco (palavras futuras antes do \k)
+            # OutlineColour = preto, Outline=4 (grosso, legível sobre qualquer bg)
+            f"Style: Default,Impact,{font_size},&H0000FFFF,&H00FFFFFF,"
+            f"&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,4,0,2,40,40,{margin_v},1\n"
+            "\n"
+            "[Events]\n"
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
+            "MarginV, Effect, Text\n"
+        )
+
+    def _segments_to_ass(self, segments: list, ass_path: Path) -> None:
+        """
+        Converte segmentos Whisper (com word_timestamps) para ASS karaoke.
+
+        Cada segment vira UMA linha Dialogue com `{\\k<dur>}` por palavra:
+          • dur em centissegundos = duração da palavra.
+          • Durante o \\k, a palavra está na SecondaryColour (branco).
+          • Após \\k expirar, vira PrimaryColour (amarelo) — efeito "fill-in".
+
+        Fallback se segment não tem `words` (ex: openai-whisper sem word_ts):
+          • Trata o segment inteiro como uma "palavra" (sem karaoke real,
+            mas mantém legenda visível).
+        """
+        header = self._build_ass_header()
+        events = []
+
+        for seg in segments:
+            words = seg.get("words") or []
+            text  = (seg.get("text") or "").strip()
+            if not text:
+                continue
+
+            seg_start = seg.get("start", 0.0)
+            seg_end   = seg.get("end",   seg_start + 1.0)
+            if seg_end <= seg_start:
+                continue
+
+            if words:
+                # Build text com \k por palavra
+                parts = []
+                for w in words:
+                    raw_w = (w.get("word") or "").strip()
+                    if not raw_w:
+                        continue
+                    w_start = w.get("start", seg_start)
+                    w_end   = w.get("end",   w_start + 0.2)
+                    # Centissegundos (clamp mínimo 1cs para evitar \k0 indefinido)
+                    dur_cs = max(1, int(round((w_end - w_start) * 100)))
+                    parts.append(f"{{\\k{dur_cs}}}{self._escape_ass_text(raw_w)} ")
+                text_line = "".join(parts).rstrip()
+                line_start, line_end = words[0].get("start", seg_start), words[-1].get("end", seg_end)
+            else:
+                # Sem word_timestamps: linha plana sem karaoke
+                text_line = self._escape_ass_text(text)
+                line_start, line_end = seg_start, seg_end
+
+            start_str = self._seconds_to_ass_time(line_start)
+            end_str   = self._seconds_to_ass_time(line_end)
+            events.append(
+                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{text_line}\n"
+            )
+
+        ass_path.write_text(header + "".join(events), encoding="utf-8")
 
     # ------------------------------------------------------------------
     # Commercial break detection
@@ -471,28 +593,32 @@ class VideoEditor:
         # ── Legendas (com safe area dinâmica) ─────────────────────────────
         sub_filter = ""
         if srt_path and cfg["subtitles"]["enabled"]:
-            font      = cfg["subtitles"]["font"]
-            font_size = cfg["subtitles"]["font_size"]
-            outline_w = cfg["subtitles"]["outline_width"]
-            srt_esc   = str(srt_path).replace("\\", "/").replace(":", "\\:")
+            srt_esc = str(srt_path).replace("\\", "/").replace(":", "\\:")
+            is_ass  = str(srt_path).lower().endswith(".ass")
 
-            # MarginV dinâmico por preset de plataforma
-            layout    = cfg.get("layout_preset", "tiktok")
-            margin_v  = cfg["subtitles"].get("margin_v", None)
-            if margin_v is None:
-                _preset_margins = {"tiktok": 220, "shorts": 200, "reels": 210}
-                margin_v = _preset_margins.get(layout, 220)
-
-            # FontSize limitado para não dominar a tela em 1080×1920
-            effective_fs = min(font_size, 12)
-
-            sub_filter = (
-                f"subtitles='{srt_esc}':"
-                f"force_style='FontName={font},FontSize={effective_fs},"
-                f"PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,"
-                f"Outline={outline_w},Bold=1,Alignment=2,"
-                f"MarginV={margin_v},WrapStyle=0'"
-            )
+            if is_ass:
+                # Iter2 PR2: arquivo .ass já contém [V4+ Styles] inline.
+                # force_style sobrescreveria o karaoke; deixar libass usar
+                # o style do próprio arquivo é o que faz \k funcionar.
+                sub_filter = f"subtitles='{srt_esc}'"
+            else:
+                # Fallback SRT legado (force_style estilo SRT plano)
+                font      = cfg["subtitles"]["font"]
+                font_size = cfg["subtitles"]["font_size"]
+                outline_w = cfg["subtitles"]["outline_width"]
+                layout    = cfg.get("layout_preset", "tiktok")
+                margin_v  = cfg["subtitles"].get("margin_v")
+                if margin_v is None:
+                    _preset_margins = {"tiktok": 220, "shorts": 200, "reels": 210}
+                    margin_v = _preset_margins.get(layout, 220)
+                effective_fs = min(font_size, 12)
+                sub_filter = (
+                    f"subtitles='{srt_esc}':"
+                    f"force_style='FontName={font},FontSize={effective_fs},"
+                    f"PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,"
+                    f"Outline={outline_w},Bold=1,Alignment=2,"
+                    f"MarginV={margin_v},WrapStyle=0'"
+                )
 
         # ── Title banner (drawtext) ──────────────────────────────────────────
         title_filter = ""
@@ -636,8 +762,11 @@ class VideoEditor:
                             )
                             return None
 
-                    srt_path = tmp / "subtitles.srt"
-                    self._segments_to_srt(segments, srt_path)
+                    # Iter2 PR2: ASS karaoke (com word_timestamps do Whisper).
+                    # Fallback SRT é mantido como variável de mesmo nome (srt_path)
+                    # para compat com _build_ffmpeg_filter que decide o filter.
+                    srt_path = tmp / "subtitles.ass"
+                    self._segments_to_ass(segments, srt_path)
 
             # --- Speaker tracking (Iter2): detecta rosto e propõe crop dinâmico ---
             # Custo: ~3-12s por clip (extract frames sparse + Haar Cascade CPU).
