@@ -196,6 +196,151 @@ def _find_hook_start_impl(video_path, original_start: float, pre_roll: float,
 # (C) QualityGate
 # ──────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────
+# (D) OfflineScreenDetector
+# ──────────────────────────────────────────────────────────────────────
+
+def _audio_coeff_variation(video_path, start_sec: float, duration: float) -> float:
+    """
+    Coeficient of variation (std/mean) do RMS audio por chunks de 1s.
+
+    Música em loop / silêncio constante / "stream starting soon" tem RMS
+    uniforme → CV baixo (~0.05-0.15).
+    Fala humana com efeitos/reações tem RMS variando → CV alto (~0.4-1.5).
+
+    Métrica robusta a volume absoluto (CV é normalizado pela média).
+    Retorna 1.0 se não há áudio suficiente pra avaliar.
+    """
+    video_path = Path(video_path)
+    cmd = [
+        "ffmpeg", "-ss", str(start_sec), "-i", str(video_path),
+        "-t", str(duration),
+        "-vn", "-ac", "1", "-ar", "16000",
+        "-f", "f32le", "-acodec", "pcm_f32le",
+        "pipe:1"
+    ]
+    try:
+        result = run_ffmpeg(cmd, label="audio_cv",
+                            timeout=15, capture_stdout=True, quiet=True)
+        if not result.ok or len(result.stdout) < 16000 * 4 * 2:
+            return 1.0   # < 2s de áudio → não avalia
+
+        raw_len = (len(result.stdout) // 4) * 4
+        audio = np.frombuffer(result.stdout[:raw_len], dtype=np.float32)
+
+        # Chunks de 1s (16000 samples a 16kHz)
+        chunk_size = 16000
+        n_chunks = audio.size // chunk_size
+        if n_chunks < 2:
+            return 1.0
+
+        chunks = audio[: n_chunks * chunk_size].reshape(n_chunks, chunk_size).astype(np.float64)
+        rms_per_chunk = np.sqrt(np.mean(np.square(chunks), axis=1))
+        mean = float(np.mean(rms_per_chunk))
+        if mean < 1e-6:
+            return 0.0   # silêncio absoluto → CV degenera
+
+        return float(np.std(rms_per_chunk) / mean)
+
+    except Exception as e:
+        logger.debug(f"Erro audio_cv: {e}")
+        return 1.0
+
+
+def is_offline_screen(video_path, duration_sec: float = 8.0,
+                      motion_max: float = 3.0,
+                      audio_cv_max: float = 0.18,
+                      audio_silence_max: float = 0.005) -> tuple:
+    """
+    Detecta tela "OFFLINE PLACEHOLDER" (countdown, "Stream Will Be On...").
+
+    Dispara OFFLINE em 2 caminhos independentes:
+
+      Caminho A (alta confiança — silêncio absoluto):
+        • Audio RMS médio < audio_silence_max (~ -46dBFS)
+        Streams humanas reais NUNCA têm 8s sem nenhum som (mesmo dramatic
+        pause carrega room noise ~ -40dB). RMS=0 → áudio "morto" → offline.
+
+      Caminho B (motion estática + áudio uniforme):
+        • Motion mean < motion_max E
+        • Audio CV (std/mean) < audio_cv_max
+        Frames quase idênticos + RMS uniforme = música em loop / countdown.
+
+    Falsos positivos protegidos:
+      • Fala calma com cena escura: motion baixo, audio_cv ALTO → não offline
+      • Música ambiente em scene change: audio_cv baixo, motion ALTO → não offline
+
+    Returns: (is_offline: bool, info: str).
+    Custo: ~1.5s (1 motion + 1 audio extract, ambos quiet).
+    """
+    video_path = Path(video_path)
+
+    motion_mean = _extract_motion_score(video_path, 0.0, duration_sec)
+
+    # Audio: extrai 1× e calcula mean + cv num passo só (evita 2× ffmpeg)
+    rms_mean, audio_cv = _audio_rms_and_cv(video_path, 0.0, duration_sec)
+
+    # Caminho A: silêncio absoluto (super forte; quase 0 falsos positivos)
+    if rms_mean < audio_silence_max:
+        info = (
+            f"motion={motion_mean:.2f} rms_mean={rms_mean:.5f} "
+            f"(silêncio < {audio_silence_max}) → OFFLINE SCREEN"
+        )
+        return (True, info)
+
+    # Caminho B: motion estática + audio loop (música/efeito constante)
+    motion_static = motion_mean < motion_max
+    audio_flat    = audio_cv    < audio_cv_max
+    is_offline    = motion_static and audio_flat
+
+    info = (
+        f"motion={motion_mean:.2f} (max={motion_max}) "
+        f"rms={rms_mean:.4f} audio_cv={audio_cv:.3f} (max={audio_cv_max})"
+    )
+    if is_offline:
+        info += " → OFFLINE SCREEN"
+    return (is_offline, info)
+
+
+def _audio_rms_and_cv(video_path, start_sec: float, duration: float) -> tuple:
+    """
+    Extrai áudio 1× e retorna (rms_mean, rms_cv) — evita 2× ffmpeg.
+    rms_cv = coefficient of variation (std/mean) por chunks de 1s.
+    """
+    video_path = Path(video_path)
+    cmd = [
+        "ffmpeg", "-ss", str(start_sec), "-i", str(video_path),
+        "-t", str(duration),
+        "-vn", "-ac", "1", "-ar", "16000",
+        "-f", "f32le", "-acodec", "pcm_f32le",
+        "pipe:1"
+    ]
+    try:
+        result = run_ffmpeg(cmd, label="audio_rms_cv",
+                            timeout=15, capture_stdout=True, quiet=True)
+        if not result.ok or len(result.stdout) < 16000 * 4 * 2:
+            return (0.0, 1.0)
+
+        raw_len = (len(result.stdout) // 4) * 4
+        audio = np.frombuffer(result.stdout[:raw_len], dtype=np.float32)
+
+        chunk_size = 16000
+        n_chunks = audio.size // chunk_size
+        if n_chunks < 2:
+            return (0.0, 1.0)
+
+        chunks = audio[: n_chunks * chunk_size].reshape(n_chunks, chunk_size).astype(np.float64)
+        rms_per_chunk = np.sqrt(np.mean(np.square(chunks), axis=1))
+        mean = float(np.mean(rms_per_chunk))
+        if mean < 1e-6:
+            return (0.0, 0.0)
+        return (mean, float(np.std(rms_per_chunk) / mean))
+
+    except Exception as e:
+        logger.debug(f"Erro audio_rms_and_cv: {e}")
+        return (0.0, 1.0)
+
+
 def quality_gate(raw_clip_path, min_rms: float = 0.01,
                  min_motion: float = 5.0) -> tuple:
     """

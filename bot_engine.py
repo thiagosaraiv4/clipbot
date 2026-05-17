@@ -804,7 +804,23 @@ class BotEngine:
 
                             capture.extract_segment(raw_file, start, end, raw_clip)
 
-                            # (3) QualityGate
+                            # (3a) OfflineScreenGate \u2014 pega countdown/placeholder
+                            # ANTES do QualityGate (mais barato + mais decisivo).
+                            try:
+                                from clip_analyzer import is_offline_screen
+                                is_off, off_info = is_offline_screen(raw_clip, duration_sec=8.0)
+                                if is_off:
+                                    logger.warning(
+                                        f"\U0001f6ab [{label}] OfflineScreen: {off_info} \u2014 SKIP"
+                                    )
+                                    _metrics_incr("engine.skipped_offline",
+                                                  platform=platform, channel=clean)
+                                    raw_clip.unlink(missing_ok=True)
+                                    continue
+                            except Exception as e:
+                                logger.debug(f"offline_screen check falhou: {e}")
+
+                            # (3b) QualityGate
                             if ca_cfg.get("enabled", False):
                                 qg = ca_cfg.get("quality_gate", {})
                                 if qg.get("enabled", True):
@@ -1026,6 +1042,23 @@ class BotEngine:
             output_dir.mkdir(parents=True, exist_ok=True)
 
             logger.info(f"🎬 Gerando clip do momento {moment_id[:8]} [{entry['reason']}]…")
+
+            # OfflineScreenGate: pega countdown / "stream starting soon" / placeholder
+            # ANTES de gastar Whisper title + LLM + editor.process (~20s economizados).
+            try:
+                from clip_analyzer import is_offline_screen
+                is_off, off_info = is_offline_screen(raw_clip, duration_sec=8.0)
+                if is_off:
+                    logger.warning(
+                        f"\U0001f6ab Clip {moment_id[:8]} é OFFLINE SCREEN: {off_info} — SKIP"
+                    )
+                    _metrics_incr("engine.skipped_offline",
+                                  channel=entry.get("channel", "?"),
+                                  reason=entry.get("reason", "?"))
+                    self.pending_store.remove_and_cleanup(moment_id)
+                    return {"ok": False, "error": f"Offline screen detectada: {off_info}"}
+            except Exception as e:
+                logger.debug(f"offline_screen check falhou: {e}")
 
             # Título para o banner: custom (da UI) ou automático por reason
             if not title_text:
