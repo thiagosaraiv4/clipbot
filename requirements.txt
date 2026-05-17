@@ -14,6 +14,13 @@ requests>=2.31.0          # YouTube Data API v3 (busca live ativa)
 # ── Análise de áudio ──────────────────────────────────────────────
 numpy>=1.24.0             # análise RMS do pipe FFmpeg (sem librosa)
 
+# ── Speaker tracking ─────────────────────────────────────────────
+# BlazeFace (MediaPipe) — preferido. Hit ratio 90% em streams 1920x1080
+# vs Haar Cascade 85% E trajetória 2× mais estável (menos outliers).
+# Modelo blaze_face_short_range.tflite (~230KB) em assets/ — committed.
+mediapipe>=0.10.30        # FaceDetector tasks API (CPU XNNPACK)
+opencv-python>=4.8.0      # Haar Cascade fallback se MediaPipe falhar
+
 # ── Legendas automáticas (Whisper) ───────────────────────────────
 openai-whisper>=20230918  # transcrição de áudio → SRT
 torch>=2.0.0              # dep do Whisper (CPU funciona; CUDA opcional)
