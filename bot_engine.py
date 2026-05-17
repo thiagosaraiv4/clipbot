@@ -536,7 +536,20 @@ class BotEngine:
     def _monitor_platform(self, platform: str, channel: str,
                            clips_dir: Path, editor, uploader, desc_gen,
                            title_gen=None, config: dict = None) -> None:
-        """Monitora UM canal em sua própria thread. try/finally garante cleanup."""
+        """
+        Monitora UM canal em sua própria thread, com **auto-restart**.
+
+        Loop externo de retry com backoff exponencial:
+          • Falha de start_recording (offline/network) → backoff 30s→60s→120s→...→600s
+          • Watchdog detecta stream FROZEN >120s → restart isolado do canal
+          • Captura rodando >5min com sucesso → reseta backoff pra 30s
+          • Engine stop_event → sai imediatamente do loop
+
+        Cada attempt cria novo StreamCapture + MomentDetector. O `processed` dict
+        é local de attempt — só serve pra evitar processar 2× o mesmo momento
+        durante uma única gravação contínua. Após reconexão, novo .ts file =
+        novos timestamps relativos.
+        """
         from stream_capture  import StreamCapture
         from moment_detector import MomentDetector
         import copy
@@ -547,338 +560,419 @@ class BotEngine:
 
         clean    = self._clean_channel_name(channel)
         label    = f"{platform.upper()}:{clean}"
-        capture  = StreamCapture(cfg, str(clips_dir))
-        processed: dict = {}          # key → timestamp (para poda periódica)
-        last_clip_time: float = 0.0
-        _PRUNE_AGE = 3600.0           # descarta entradas com >1h
 
-        try:
-            raw_file = capture.start_recording(platform)
-        except Exception as e:
-            logger.error(f"❌ [{label}] Captura falhou: {e}")
-            return
+        # ── Estado do loop de retry (escopo da thread) ────────────────────────
+        _RETRY_BACKOFF_INIT = 30.0
+        _RETRY_BACKOFF_MAX  = 600.0   # 10min teto
+        _RETRY_BACKOFF_MULT = 2.0
+        _RETRY_RESET_AFTER  = 300.0   # 5min de uptime resetam backoff
+        backoff_s = _RETRY_BACKOFF_INIT
+        attempt   = 0
 
-        detector = MomentDetector(cfg, elapsed_fn=capture.get_elapsed_seconds)
-        detector.start(raw_file)
+        while not self._stop_event.is_set():
+            attempt += 1
+            attempt_start_ts = time.time()
+            if attempt > 1:
+                logger.info(
+                    f"🔄 [{label}] Reconectando (attempt #{attempt})..."
+                )
+                _metrics_incr("capture.reconnect_attempt", platform=platform)
 
-        approval_mode  = config.get("system", {}).get("approval_mode", False)
-        approval_top_n = int(config.get("system", {}).get("approval_top_n", 12))
+            # Per-attempt state
+            capture       = StreamCapture(cfg, str(clips_dir))
+            processed: dict = {}
+            last_clip_time: float = 0.0
+            _PRUNE_AGE    = 3600.0
+            _restart_now  = False   # flag setada pelo watchdog em frozen prolongado
 
-        # ── Watchdog: detecta live caída (raw .ts congelado) ──────────────────
-        # Stream Twitch best ~6 Mbps = ~45 MB/min crescimento esperado.
-        # Se raw_file não cresce em FROZEN_THRESHOLD segundos = anomalia
-        # (live caiu, network glitch, ffmpeg travou em reconnect HLS).
-        _WD_CHECK_INTERVAL = 15.0     # entre samples
-        _WD_FROZEN_THRESHOLD = 60.0   # sem crescimento → frozen
-        _WD_REWARN_INTERVAL = 120.0   # re-emite warn a cada 2min se permanecer frozen
-        _wd_last_size = 0
-        _wd_last_growth_t = time.time()
-        _wd_last_check_t = time.time()
-        _wd_last_warn_t = 0.0
-        _wd_state = "ok"               # "ok" | "frozen"
+            try:
+                raw_file = capture.start_recording(platform)
+            except Exception as e:
+                logger.error(f"❌ [{label}] Captura falhou (attempt #{attempt}): {e}")
+                # Backoff antes de tentar de novo. Se stop_event veio durante
+                # o wait, sai do loop externo.
+                if self._stop_event.wait(timeout=backoff_s):
+                    return
+                backoff_s = min(_RETRY_BACKOFF_MAX, backoff_s * _RETRY_BACKOFF_MULT)
+                continue
 
-        try:
-            while not self._stop_event.is_set():
-                self._stop_event.wait(timeout=1)
-                if self._stop_event.is_set():
-                    break
+            detector = MomentDetector(cfg, elapsed_fn=capture.get_elapsed_seconds)
+            detector.start(raw_file)
 
-                moments = detector.all_moments
+            approval_mode  = config.get("system", {}).get("approval_mode", False)
+            approval_top_n = int(config.get("system", {}).get("approval_top_n", 12))
 
-                # Poda periódica do dict processed (>1h)
-                now_ts = time.time()
-                if len(processed) > 500:
-                    processed = {k: t for k, t in processed.items()
-                                 if now_ts - t < _PRUNE_AGE}
+            # ── Watchdog: detecta live caída (raw .ts congelado) ──────────────────
+            # Stream Twitch best ~6 Mbps = ~45 MB/min crescimento esperado.
+            # Se raw_file não cresce em FROZEN_THRESHOLD segundos = anomalia
+            # (live caiu, network glitch, ffmpeg travou em reconnect HLS).
+            _WD_CHECK_INTERVAL = 15.0     # entre samples
+            _WD_FROZEN_THRESHOLD = 60.0   # sem crescimento → frozen
+            _WD_REWARN_INTERVAL = 120.0   # re-emite warn a cada 2min se permanecer frozen
+            _wd_last_size = 0
+            _wd_last_growth_t = time.time()
+            _wd_last_check_t = time.time()
+            _wd_last_warn_t = 0.0
+            _wd_state = "ok"               # "ok" | "frozen"
 
-                # ── Watchdog: live caída? ─────────────────────────────────────
-                if now_ts - _wd_last_check_t >= _WD_CHECK_INTERVAL:
-                    _wd_last_check_t = now_ts
-                    try:
-                        cur_size = raw_file.stat().st_size
-                    except Exception:
-                        cur_size = _wd_last_size
+            try:
+                while not self._stop_event.is_set():
+                    self._stop_event.wait(timeout=1)
+                    if self._stop_event.is_set():
+                        break
 
-                    if cur_size > _wd_last_size:
-                        # Cresceu: live OK. Resetar timer e estado se estava frozen.
-                        bytes_per_s = (cur_size - _wd_last_size) / _WD_CHECK_INTERVAL
-                        _wd_last_size = cur_size
-                        _wd_last_growth_t = now_ts
-                        if _wd_state == "frozen":
-                            logger.info(f"✅ [{label}] Stream voltou (live recuperou)")
-                            _metrics_incr("capture.recovered", platform=platform)
-                            _wd_state = "ok"
-                            _wd_last_warn_t = 0.0
-                        # Gauge informativo (uma observação por canal)
+                    moments = detector.all_moments
+
+                    # Poda periódica do dict processed (>1h)
+                    now_ts = time.time()
+                    if len(processed) > 500:
+                        processed = {k: t for k, t in processed.items()
+                                     if now_ts - t < _PRUNE_AGE}
+
+                    # ── Watchdog: live caída? ─────────────────────────────────────
+                    if now_ts - _wd_last_check_t >= _WD_CHECK_INTERVAL:
+                        _wd_last_check_t = now_ts
                         try:
-                            from metrics import observe as _m_obs
-                            _m_obs("capture.bytes_per_sec", bytes_per_s,
-                                   platform=platform)
+                            cur_size = raw_file.stat().st_size
                         except Exception:
-                            pass
-                    else:
-                        # Sem crescimento. Quanto tempo está parado?
-                        frozen_for = now_ts - _wd_last_growth_t
-                        if frozen_for >= _WD_FROZEN_THRESHOLD:
-                            should_warn = (
-                                _wd_state == "ok"   # primeira vez
-                                or (now_ts - _wd_last_warn_t >= _WD_REWARN_INTERVAL)
-                            )
-                            if should_warn:
-                                logger.warning(
-                                    f"⚠️  [{label}] Stream FROZEN — raw .ts sem "
-                                    f"crescimento há {frozen_for:.0f}s "
-                                    f"(live caiu / network glitch / ffmpeg travou)"
-                                )
-                                _metrics_incr("capture.frozen",
-                                              platform=platform, channel=clean)
-                                _wd_state = "frozen"
-                                _wd_last_warn_t = now_ts
+                            cur_size = _wd_last_size
 
-                # ── Modo aprovação: enfileira para revisão da UI ───────────────
-                if approval_mode:
-                    candidates = []
+                        if cur_size > _wd_last_size:
+                            # Cresceu: live OK. Resetar timer e estado se estava frozen.
+                            bytes_per_s = (cur_size - _wd_last_size) / _WD_CHECK_INTERVAL
+                            _wd_last_size = cur_size
+                            _wd_last_growth_t = now_ts
+                            if _wd_state == "frozen":
+                                logger.info(f"✅ [{label}] Stream voltou (live recuperou)")
+                                _metrics_incr("capture.recovered", platform=platform)
+                                _wd_state = "ok"
+                                _wd_last_warn_t = 0.0
+                            # Gauge informativo (uma observação por canal)
+                            try:
+                                from metrics import observe as _m_obs
+                                _m_obs("capture.bytes_per_sec", bytes_per_s,
+                                       platform=platform)
+                            except Exception:
+                                pass
+                        else:
+                            # Sem crescimento. Quanto tempo está parado?
+                            frozen_for = now_ts - _wd_last_growth_t
+                            if frozen_for >= _WD_FROZEN_THRESHOLD:
+                                should_warn = (
+                                    _wd_state == "ok"   # primeira vez
+                                    or (now_ts - _wd_last_warn_t >= _WD_REWARN_INTERVAL)
+                                )
+                                if should_warn:
+                                    logger.warning(
+                                        f"⚠️  [{label}] Stream FROZEN — raw .ts sem "
+                                        f"crescimento há {frozen_for:.0f}s "
+                                        f"(live caiu / network glitch / ffmpeg travou)"
+                                    )
+                                    _metrics_incr("capture.frozen",
+                                                  platform=platform, channel=clean)
+                                    _wd_state = "frozen"
+                                    _wd_last_warn_t = now_ts
+
+                            # Trigger AUTO-RESTART do canal: frozen >120s.
+                            # Damos 60s pro warn aparecer + 60s pra streamlink tentar
+                            # se recuperar. Se nada, desiste e reconecta com backoff.
+                            if frozen_for >= 120.0:
+                                logger.warning(
+                                    f"🔄 [{label}] FROZEN >120s — auto-restart do canal"
+                                )
+                                _metrics_incr("capture.auto_restart",
+                                              platform=platform, channel=clean)
+                                _restart_now = True
+                                break   # sai do inner while → cleanup → outer retry
+
+                    # ── Modo aprovação: enfileira para revisão da UI ───────────────
+                    if approval_mode:
+                        candidates = []
+                        for m in moments:
+                            key = (label, round(m.start_sec, 1), m.reason)
+                            if key in processed:
+                                continue
+                            if capture.get_elapsed_seconds() < m.end_sec + 2:
+                                continue
+                            candidates.append((key, m))
+
+                        # Ordena por score desc e toma top N por ciclo
+                        candidates.sort(key=lambda x: x[1].score, reverse=True)
+                        for key, m in candidates[:approval_top_n]:
+                            processed[key] = now_ts
+                            logger.info(
+                                f"📋 [{label}] [{m.reason}] "
+                                f"{m.start_sec:.1f}s→{m.end_sec:.1f}s  "
+                                f"score={m.score:.2f} → pendente aprovação"
+                            )
+                            try:
+                                ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                raw_name = f"pending_{platform}_{clean}_{ts}_{m.reason}"
+                                raw_clip = clips_dir / f"raw_{raw_name}.ts"
+
+                                min_dur = config["detection"]["audio_spike"]["min_clip_duration"]
+                                seg_start, seg_end = m.start_sec, m.end_sec
+                                if (seg_end - seg_start) < min_dur:
+                                    pad       = (min_dur - (seg_end - seg_start)) / 2
+                                    seg_start = max(0.0, seg_start - pad)
+                                    seg_end   = seg_end + pad
+
+                                capture.extract_segment(raw_file, seg_start, seg_end, raw_clip)
+
+                                self.pending_store.add(m, raw_clip, platform, clean)
+                                entry = self.pending_store.get(m.moment_id)
+                                if entry:
+                                    self.on_moment_pending(entry)
+                            except Exception as e:
+                                logger.error(f"❌ [{label}] Pending {m.reason}: {e}")
+                        continue   # ← não cai no bloco de extração automática
+
+                    # ── Modo automático: extrai e posta sem aprovação ─────────────
                     for m in moments:
                         key = (label, round(m.start_sec, 1), m.reason)
                         if key in processed:
                             continue
                         if capture.get_elapsed_seconds() < m.end_sec + 2:
                             continue
-                        candidates.append((key, m))
 
-                    # Ordena por score desc e toma top N por ciclo
-                    candidates.sort(key=lambda x: x[1].score, reverse=True)
-                    for key, m in candidates[:approval_top_n]:
                         processed[key] = now_ts
                         logger.info(
-                            f"📋 [{label}] [{m.reason}] "
-                            f"{m.start_sec:.1f}s→{m.end_sec:.1f}s  "
-                            f"score={m.score:.2f} → pendente aprovação"
+                            f"🎯 [{label}] [{m.reason}] "
+                            f"{m.start_sec:.1f}s → {m.end_sec:.1f}s  score={m.score:.2f}"
                         )
-                        try:
-                            ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            raw_name = f"pending_{platform}_{clean}_{ts}_{m.reason}"
-                            raw_clip = clips_dir / f"raw_{raw_name}.ts"
 
-                            min_dur = config["detection"]["audio_spike"]["min_clip_duration"]
-                            seg_start, seg_end = m.start_sec, m.end_sec
-                            if (seg_end - seg_start) < min_dur:
-                                pad       = (min_dur - (seg_end - seg_start)) / 2
-                                seg_start = max(0.0, seg_start - pad)
-                                seg_end   = seg_end + pad
-
-                            capture.extract_segment(raw_file, seg_start, seg_end, raw_clip)
-
-                            self.pending_store.add(m, raw_clip, platform, clean)
-                            entry = self.pending_store.get(m.moment_id)
-                            if entry:
-                                self.on_moment_pending(entry)
-                        except Exception as e:
-                            logger.error(f"❌ [{label}] Pending {m.reason}: {e}")
-                    continue   # ← não cai no bloco de extração automática
-
-                # ── Modo automático: extrai e posta sem aprovação ─────────────
-                for m in moments:
-                    key = (label, round(m.start_sec, 1), m.reason)
-                    if key in processed:
-                        continue
-                    if capture.get_elapsed_seconds() < m.end_sec + 2:
-                        continue
-
-                    processed[key] = now_ts
-                    logger.info(
-                        f"🎯 [{label}] [{m.reason}] "
-                        f"{m.start_sec:.1f}s → {m.end_sec:.1f}s  score={m.score:.2f}"
-                    )
-
-                    # Score avançado com recency e chat
-                    from feedback import score_moment_advanced
-                    secs_since = (time.time() - last_clip_time) if last_clip_time > 0 else None
-                    chat_ratio = None
-                    if hasattr(detector, 'chat') and detector.chat and hasattr(detector.chat, 'chat_rate_ratio'):
-                        chat_ratio = detector.chat.chat_rate_ratio
-                    adv_score = score_moment_advanced(
-                        {"reason": m.reason, "score": m.score},
-                        duration=m.end_sec - m.start_sec,
-                        seconds_since_last_clip=secs_since,
-                        chat_rate_ratio=chat_ratio,
-                        channel=channel,
-                    )
-                    if adv_score < 0.15:
-                        logger.info(f"⏭️ [{label}] Score avançado muito baixo ({adv_score:.3f}), pulando")
-                        continue
-
-                    try:
-                        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        name     = f"clip_{platform}_{clean}_{ts}_{m.reason}"
-                        raw_clip = clips_dir / f"raw_{name}.ts"
-
-                        min_dur = config["detection"]["audio_spike"]["min_clip_duration"]
-                        start, end = m.start_sec, m.end_sec
-                        if (end - start) < min_dur:
-                            pad   = (min_dur - (end - start)) / 2
-                            start = max(0.0, start - pad)
-                            end   = end + pad
-
-                        # ── ClipBot v3: Reaction + Hook + QualityGate ───
-                        ca_cfg = config["editing"].get("clip_analysis", {})
-                        if ca_cfg.get("enabled", False):
-                            from clip_analyzer import compute_reaction_score, find_hook_start, quality_gate
-
-                            # (1) ReactionDetector
-                            reaction = compute_reaction_score(
-                                raw_file, m.start_sec, m.end_sec,
-                                audio_norm=ca_cfg.get("audio_norm", 0.06),
-                                motion_norm=ca_cfg.get("motion_norm", 12.0),
-                            )
-                            rw = ca_cfg.get("reaction_weight", 0.5)
-                            effective_score = adv_score * (1 - rw + rw * reaction)
-                            logger.info(
-                                f"\U0001f3ad [{label}] Reaction: {reaction:.2f}  "
-                                f"base={adv_score:.2f}  effective={effective_score:.2f}"
-                            )
-                            if effective_score < 0.10:
-                                logger.info(f"\u23ed\ufe0f [{label}] Score efetivo baixo ({effective_score:.2f}), pulando")
-                                continue
-
-                            # (2) HookStartFinder
-                            hook_start = find_hook_start(
-                                raw_file, start,
-                                pre_roll=ca_cfg.get("hook_pre_roll", 3.0),
-                                audio_norm=ca_cfg.get("audio_norm", 0.06),
-                                motion_norm=ca_cfg.get("motion_norm", 12.0),
-                            )
-                            if hook_start < start:
-                                logger.info(f"\U0001f3af [{label}] Hook start: {start:.1f}s \u2192 {hook_start:.1f}s")
-                                start = hook_start
-
-                        capture.extract_segment(raw_file, start, end, raw_clip)
-
-                        # (3) QualityGate
-                        if ca_cfg.get("enabled", False):
-                            qg = ca_cfg.get("quality_gate", {})
-                            if qg.get("enabled", True):
-                                passed, qg_reason = quality_gate(
-                                    raw_clip,
-                                    min_rms=qg.get("min_rms", 0.01),
-                                    min_motion=qg.get("min_motion", 5.0),
-                                )
-                                if not passed:
-                                    logger.warning(f"\U0001f6ab [{label}] QualityGate: {qg_reason} \u2014 SKIP")
-                                    _metrics_incr("engine.quality_gate_failed", platform=platform)
-                                    raw_clip.unlink(missing_ok=True)
-                                    continue
-
-                        # Título context-aware via TitleGenerator
-                        moment_entry = {
-                            "reason":   m.reason,
-                            "keywords": m.keywords,
-                            "score":    m.score,
-                            "extra":    m.extra,
-                        }
-                        if title_gen:
-                            auto_title = title_gen.generate(raw_clip, moment_entry)
-                        else:
-                            auto_title = "CLIP ÉPICO DA LIVE!"
-
-                        edited = editor.process(raw_clip, name, title_text=auto_title)
-                        raw_clip.unlink(missing_ok=True)
-
-                        # process() retorna None se comercial detectado
-                        if edited is None:
-                            logger.warning(f"⏭️ [{label}] Clip descartado (comercial ou filtro)")
+                        # Score avançado com recency e chat
+                        from feedback import score_moment_advanced
+                        secs_since = (time.time() - last_clip_time) if last_clip_time > 0 else None
+                        chat_ratio = None
+                        if hasattr(detector, 'chat') and detector.chat and hasattr(detector.chat, 'chat_rate_ratio'):
+                            chat_ratio = detector.chat.chat_rate_ratio
+                        adv_score = score_moment_advanced(
+                            {"reason": m.reason, "score": m.score},
+                            duration=m.end_sec - m.start_sec,
+                            seconds_since_last_clip=secs_since,
+                            chat_rate_ratio=chat_ratio,
+                            channel=channel,
+                        )
+                        if adv_score < 0.15:
+                            logger.info(f"⏭️ [{label}] Score avançado muito baixo ({adv_score:.3f}), pulando")
                             continue
 
-                        last_clip_time = time.time()
+                        try:
+                            ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            name     = f"clip_{platform}_{clean}_{ts}_{m.reason}"
+                            raw_clip = clips_dir / f"raw_{name}.ts"
 
-                        logger.info("✨ Gerando descrições com IA...")
-                        all_results = {}
+                            min_dur = config["detection"]["audio_spike"]["min_clip_duration"]
+                            start, end = m.start_sec, m.end_sec
+                            if (end - start) < min_dur:
+                                pad   = (min_dur - (end - start)) / 2
+                                start = max(0.0, start - pad)
+                                end   = end + pad
 
-                        active_upload = {
-                            "tiktok":    config["upload"]["tiktok"]["enabled"],
-                            "instagram": config["upload"]["instagram"]["enabled"],
-                            "youtube":   config["upload"]["youtube"]["enabled"],
-                        }
+                            # ── ClipBot v3: Reaction + Hook + QualityGate ───
+                            ca_cfg = config["editing"].get("clip_analysis", {})
+                            if ca_cfg.get("enabled", False):
+                                from clip_analyzer import compute_reaction_score, find_hook_start, quality_gate
 
-                        for upload_plat, enabled in active_upload.items():
-                            if not enabled:
+                                # (1) ReactionDetector
+                                reaction = compute_reaction_score(
+                                    raw_file, m.start_sec, m.end_sec,
+                                    audio_norm=ca_cfg.get("audio_norm", 0.06),
+                                    motion_norm=ca_cfg.get("motion_norm", 12.0),
+                                )
+                                rw = ca_cfg.get("reaction_weight", 0.5)
+                                effective_score = adv_score * (1 - rw + rw * reaction)
+                                logger.info(
+                                    f"\U0001f3ad [{label}] Reaction: {reaction:.2f}  "
+                                    f"base={adv_score:.2f}  effective={effective_score:.2f}"
+                                )
+                                if effective_score < 0.10:
+                                    logger.info(f"\u23ed\ufe0f [{label}] Score efetivo baixo ({effective_score:.2f}), pulando")
+                                    continue
+
+                                # (2) HookStartFinder
+                                hook_start = find_hook_start(
+                                    raw_file, start,
+                                    pre_roll=ca_cfg.get("hook_pre_roll", 3.0),
+                                    audio_norm=ca_cfg.get("audio_norm", 0.06),
+                                    motion_norm=ca_cfg.get("motion_norm", 12.0),
+                                )
+                                if hook_start < start:
+                                    logger.info(f"\U0001f3af [{label}] Hook start: {start:.1f}s \u2192 {hook_start:.1f}s")
+                                    start = hook_start
+
+                            capture.extract_segment(raw_file, start, end, raw_clip)
+
+                            # (3) QualityGate
+                            if ca_cfg.get("enabled", False):
+                                qg = ca_cfg.get("quality_gate", {})
+                                if qg.get("enabled", True):
+                                    passed, qg_reason = quality_gate(
+                                        raw_clip,
+                                        min_rms=qg.get("min_rms", 0.01),
+                                        min_motion=qg.get("min_motion", 5.0),
+                                    )
+                                    if not passed:
+                                        logger.warning(f"\U0001f6ab [{label}] QualityGate: {qg_reason} \u2014 SKIP")
+                                        _metrics_incr("engine.quality_gate_failed", platform=platform)
+                                        raw_clip.unlink(missing_ok=True)
+                                        continue
+
+                            # Título context-aware via TitleGenerator
+                            moment_entry = {
+                                "reason":   m.reason,
+                                "keywords": m.keywords,
+                                "score":    m.score,
+                                "extra":    m.extra,
+                            }
+                            if title_gen:
+                                auto_title = title_gen.generate(raw_clip, moment_entry)
+                                # Iter2 PR4: emojis inline nas legendas (LLM Real Oficial style).
+                                # Se cascata caiu p/ template, last_subtitle_emojis = {} (no-op).
+                                sub_emojis = getattr(title_gen, "last_subtitle_emojis", {}) or {}
+                            else:
+                                auto_title = "CLIP ÉPICO DA LIVE!"
+                                sub_emojis = {}
+
+                            edited = editor.process(
+                                raw_clip, name,
+                                title_text=auto_title,
+                                subtitle_emojis=sub_emojis,
+                            )
+                            raw_clip.unlink(missing_ok=True)
+
+                            # process() retorna None se comercial detectado
+                            if edited is None:
+                                logger.warning(f"⏭️ [{label}] Clip descartado (comercial ou filtro)")
                                 continue
-                            try:
-                                desc    = desc_gen.generate(
-                                    video_path=edited, platform=upload_plat,
-                                    channel=clean, reason=m.reason,
-                                )
-                                title   = desc["title"]
-                                caption = desc["caption"]
-                                tags    = desc["hashtags"]
-                                logger.info(f"📝 [{upload_plat}] {title}")
 
-                                if upload_plat == "tiktok" and uploader.tiktok:
-                                    all_results["tiktok"] = uploader.tiktok.upload(
-                                        edited, caption, tags)
-                                elif upload_plat == "instagram" and uploader.instagram:
-                                    all_results["instagram"] = uploader.instagram.upload(
-                                        edited, caption)
-                                elif upload_plat == "youtube" and uploader.youtube:
-                                    all_results["youtube"] = uploader.youtube.upload(
-                                        edited, title, caption)
+                            last_clip_time = time.time()
 
-                                _metrics_incr(
-                                    "engine.upload_attempt",
-                                    platform=upload_plat,
-                                    ok=str(bool(all_results.get(upload_plat))),
-                                )
+                            logger.info("✨ Gerando descrições com IA...")
+                            all_results = {}
 
-                                delay = config["upload"]["delay_between_posts"]
-                                if all_results.get(upload_plat) and delay > 0:
-                                    logger.info(f"⏳ Delay {delay}s entre uploads...")
-                                    self._stop_event.wait(timeout=delay)
+                            active_upload = {
+                                "tiktok":    config["upload"]["tiktok"]["enabled"],
+                                "instagram": config["upload"]["instagram"]["enabled"],
+                                "youtube":   config["upload"]["youtube"]["enabled"],
+                            }
 
-                            except Exception as e:
-                                logger.error(f"❌ Upload {upload_plat}: {e}")
-                                all_results[upload_plat] = False
-                                _metrics_incr("engine.upload_exception",
-                                              platform=upload_plat)
+                            for upload_plat, enabled in active_upload.items():
+                                if not enabled:
+                                    continue
+                                try:
+                                    desc    = desc_gen.generate(
+                                        video_path=edited, platform=upload_plat,
+                                        channel=clean, reason=m.reason,
+                                    )
+                                    title   = desc["title"]
+                                    caption = desc["caption"]
+                                    tags    = desc["hashtags"]
+                                    logger.info(f"📝 [{upload_plat}] {title}")
 
-                        ok = [p for p, v in all_results.items() if v]
+                                    if upload_plat == "tiktok" and uploader.tiktok:
+                                        all_results["tiktok"] = uploader.tiktok.upload(
+                                            edited, caption, tags)
+                                    elif upload_plat == "instagram" and uploader.instagram:
+                                        all_results["instagram"] = uploader.instagram.upload(
+                                            edited, caption)
+                                    elif upload_plat == "youtube" and uploader.youtube:
+                                        all_results["youtube"] = uploader.youtube.upload(
+                                            edited, title, caption)
 
-                        # ── Contadores com lock ───────────────────────────────
-                        with self._stats_lock:
-                            self.clips_today += 1
-                            self.clips_total += 1
+                                    _metrics_incr(
+                                        "engine.upload_attempt",
+                                        platform=upload_plat,
+                                        ok=str(bool(all_results.get(upload_plat))),
+                                    )
 
-                        if ok:
-                            logger.info(f"✅ [{label}] Postado em: {', '.join(ok)}")
-                        else:
-                            logger.info(f"💾 [{label}] Clip salvo: {edited}")
+                                    delay = config["upload"]["delay_between_posts"]
+                                    if all_results.get(upload_plat) and delay > 0:
+                                        logger.info(f"⏳ Delay {delay}s entre uploads...")
+                                        self._stop_event.wait(timeout=delay)
 
-                        self.on_clip_posted({
-                            "name":      name,
-                            "reason":    m.reason,
-                            "platforms": ok,
-                            "time":      datetime.now().strftime("%H:%M"),
-                        })
+                                except Exception as e:
+                                    logger.error(f"❌ Upload {upload_plat}: {e}")
+                                    all_results[upload_plat] = False
+                                    _metrics_incr("engine.upload_exception",
+                                                  platform=upload_plat)
 
-                        if config["system"]["cleanup_after_upload"] and ok:
-                            edited.unlink(missing_ok=True)
+                            ok = [p for p, v in all_results.items() if v]
 
-                    except Exception as e:
-                        logger.error(f"❌ [{label}] Clip {m.reason}: {e}")
+                            # ── Contadores com lock ───────────────────────────────
+                            with self._stats_lock:
+                                self.clips_today += 1
+                                self.clips_total += 1
 
-        except KeyboardInterrupt:
-            logger.info(f"⌨️  [{label}] Ctrl+C na thread do canal.")
-        finally:
-            # Cleanup imediato — não depende de atexit
-            logger.info(f"⏹ [{label}] Encerrando detector e captura...")
-            try:
-                detector.stop()
-            except Exception as e:
-                logger.debug(f"detector.stop: {e}")
-            try:
-                capture.stop_recording()
-            except Exception as e:
-                logger.debug(f"capture.stop_recording: {e}")
-            logger.info(f"✅ [{label}] Encerrado.")
+                            if ok:
+                                logger.info(f"✅ [{label}] Postado em: {', '.join(ok)}")
+                            else:
+                                logger.info(f"💾 [{label}] Clip salvo: {edited}")
+
+                            self.on_clip_posted({
+                                "name":      name,
+                                "reason":    m.reason,
+                                "platforms": ok,
+                                "time":      datetime.now().strftime("%H:%M"),
+                            })
+
+                            if config["system"]["cleanup_after_upload"] and ok:
+                                edited.unlink(missing_ok=True)
+
+                        except Exception as e:
+                            logger.error(f"❌ [{label}] Clip {m.reason}: {e}")
+
+            except KeyboardInterrupt:
+                logger.info(f"⌨️  [{label}] Ctrl+C na thread do canal.")
+            finally:
+                # Cleanup imediato do attempt — não depende de atexit
+                if _restart_now:
+                    logger.info(f"⏹ [{label}] Cleanup pré-restart (attempt #{attempt})")
+                else:
+                    logger.info(f"⏹ [{label}] Encerrando detector e captura...")
+                try:
+                    detector.stop()
+                except Exception as e:
+                    logger.debug(f"detector.stop: {e}")
+                try:
+                    capture.stop_recording()
+                except Exception as e:
+                    logger.debug(f"capture.stop_recording: {e}")
+                if not _restart_now:
+                    logger.info(f"✅ [{label}] Encerrado.")
+
+            # ── Pós-attempt: decide se faz restart ou encerra de vez ─────────
+            # Sai do outer loop se engine pediu stop (KeyboardInterrupt ou
+            # _stop_event.set()). Senão, faz backoff + retry.
+            if self._stop_event.is_set():
+                return
+
+            if not _restart_now:
+                # Inner loop saiu sem flag de restart = stop_event externo.
+                # Acabou natural; não retentar.
+                return
+
+            # Reset backoff se attempt durou bastante (canal estava OK até cair)
+            attempt_duration = time.time() - attempt_start_ts
+            if attempt_duration > _RETRY_RESET_AFTER:
+                logger.info(
+                    f"🔁 [{label}] Attempt rodou {attempt_duration:.0f}s OK; "
+                    f"resetando backoff para {_RETRY_BACKOFF_INIT:.0f}s"
+                )
+                backoff_s = _RETRY_BACKOFF_INIT
+                attempt = 0   # resetar contador também
+
+            logger.warning(
+                f"⏸ [{label}] Aguardando {backoff_s:.0f}s antes de reconectar..."
+            )
+            if self._stop_event.wait(timeout=backoff_s):
+                return   # stop_event chegou durante o wait
+            backoff_s = min(_RETRY_BACKOFF_MAX, backoff_s * _RETRY_BACKOFF_MULT)
+            # Loop continua → novo attempt
+
+        # outer while exit (stop_event)
+        logger.info(f"👋 [{label}] Monitor encerrado (engine stop).")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Geração de clip a partir de momento pendente (chamado pela API)
@@ -947,6 +1041,19 @@ class BotEngine:
                     title_text = "CLIP ÉPICO DA LIVE!"
 
             edited = editor.process(raw_clip, name, title_text=title_text)
+
+            # editor.process() retorna None se clip foi descartado (comercial,
+            # content_filter blacklist, ou outro motivo). Não cria sidecar nem
+            # progredir — só limpa o pending e sai.
+            if edited is None:
+                logger.warning(
+                    f"⏭️ Clip {moment_id} descartado pelo editor (comercial/filtro/SKIP)"
+                )
+                try:
+                    self.pending_store.remove_and_cleanup(moment_id)
+                except Exception as e:
+                    logger.debug(f"cleanup falhou: {e}")
+                return None
 
             # ── Sidecar JSON ──────────────────────────────────────────────────
             sidecar = edited.with_suffix(".json")

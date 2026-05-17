@@ -30,8 +30,10 @@ google-auth>=2.23.0
 google-auth-oauthlib>=1.1.0
 google-auth-httplib2>=0.1.1
 
-# ── Geração de descrições com IA ─────────────────────────────────
-anthropic>=0.26.0         # Claude API — título, descrição, hashtags
+# ── Geração de descrições com IA (cascata 3 providers) ──────────
+anthropic>=0.26.0              # Claude API — provider 1 (Haiku 4.5)
+openai>=1.50.0                 # OpenAI API — provider 2 (gpt-4o-mini)
+google-genai>=2.0.0            # Gemini API — provider 3 (Flash, free tier)
 
 # ── Build (PyInstaller) ───────────────────────────────────────────
 pyinstaller>=6.0.0

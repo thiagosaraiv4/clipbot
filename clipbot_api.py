@@ -151,6 +151,62 @@ class ClipBotAPI:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    # ─── LLM API keys (hook scorer cascata Anthropic → OpenAI → Gemini) ──────
+    def get_llm_status(self) -> dict:
+        """
+        Retorna disponibilidade de cada provider + ordem configurada.
+        Útil pra UI mostrar quais LLMs estão ativos.
+        """
+        try:
+            from hook_scorer import HookScorer, _PROVIDERS
+            # Re-checa do zero (caso usuário tenha acabado de salvar key)
+            HookScorer.reset_cache()
+            return {
+                "ok": True,
+                "available":  HookScorer.available_providers(),
+                "all":        list(_PROVIDERS.keys()),
+                "any_active": HookScorer.is_available(),
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def set_llm_keys(self, keys: dict) -> dict:
+        """
+        Salva keys dos 3 providers em credentials.enc (cifrado).
+
+        Args:
+            keys: dict com chaves opcionais:
+                - "anthropic_api_key": "sk-ant-..."
+                - "openai_api_key":    "sk-..."
+                - "google_api_key":    "AIza..."  (Gemini)
+            Valores vazios/None são ignorados (não apagam keys existentes).
+            Pra remover uma key, passe explicitamente "" e use clear=True.
+        """
+        try:
+            allowed = {"anthropic_api_key", "openai_api_key", "google_api_key"}
+            creds = load_credentials() or {}
+            updated = []
+            for k, v in (keys or {}).items():
+                if k not in allowed:
+                    continue
+                v = (v or "").strip()
+                if not v:
+                    continue
+                creds[k] = v
+                updated.append(k)
+            save_credentials(creds)
+
+            # Invalida cache pra próximo score() reconhecer as keys novas
+            try:
+                from hook_scorer import HookScorer
+                HookScorer.reset_cache()
+            except Exception:
+                pass
+
+            return {"ok": True, "updated": updated}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     # ─── Engine ───────────────────────────────────────────────────────────────
 
     def get_status(self) -> dict:

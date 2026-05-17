@@ -100,12 +100,75 @@ class StreamCapture:
         return ch if ch.startswith("http") else f"https://www.twitch.tv/{ch}"
 
     def _get_youtube_url(self) -> str:
+        """
+        Resolve URL do stream YouTube. Aceita 4 formatos no `channel_id`:
+
+          1. Watch URL completa: https://www.youtube.com/watch?v=XYZ
+             → usa direto (streamlink resolve se a live estiver no ar).
+          2. youtu.be/XYZ → idem.
+          3. @handle (ou youtube.com/@handle) → usa `youtube.com/@handle/live`
+             (URL "atalho" que YouTube redireciona pra live ativa). Funciona
+             sem API key.
+          4. Channel ID puro (UCxxxxxxxxxxxxxxxxxxxxxx, 24 chars começando UC):
+             usa YouTube Data API v3 search (requer api_key configurada).
+
+        Sem live ativa → RuntimeError("Nenhuma live ativa no YouTube").
+        """
+        raw = self.config["streams"]["youtube"]["channel_id"].strip()
+        api_key = (self.config["streams"]["youtube"].get("api_key") or "").strip()
+
+        # ── 1+2: URL direta de video ─────────────────────────────────────────
+        if "watch?v=" in raw or "youtu.be/" in raw:
+            if not raw.startswith("http"):
+                raw = "https://www.youtube.com/" + raw.lstrip("/")
+            return raw
+
+        # ── 3: handle @user ─ usa /live shortcut (sem API key) ──────────────
+        # Aceita "@nome", "youtube.com/@nome", ou URL completa com @
+        m_handle = None
+        for prefix in (
+            "https://www.youtube.com/", "https://youtube.com/",
+            "www.youtube.com/", "youtube.com/",
+        ):
+            if raw.lower().startswith(prefix):
+                rest = raw[len(prefix):].rstrip("/")
+                if rest.startswith("@"):
+                    m_handle = rest
+                break
+        if m_handle is None and raw.startswith("@"):
+            m_handle = raw
+        if m_handle:
+            return f"https://www.youtube.com/{m_handle}/live"
+
+        # ── 4: channel ID UCxxxx (24 chars) — requer api_key ────────────────
+        ch_id_clean = raw
+        # Strip prefixos comuns se passou URL completa do channel
+        for prefix in (
+            "https://www.youtube.com/channel/", "https://youtube.com/channel/",
+        ):
+            if ch_id_clean.lower().startswith(prefix):
+                ch_id_clean = ch_id_clean[len(prefix):].rstrip("/")
+                break
+
+        if not (len(ch_id_clean) == 24 and ch_id_clean.startswith("UC")):
+            raise RuntimeError(
+                f"YouTube channel_id formato desconhecido: {raw!r}. "
+                f"Use 'https://www.youtube.com/watch?v=ID' (vídeo direto), "
+                f"'@handle' (sem API key), ou 'UCxxxxxxxxxxxxxxxxxxxxxx' "
+                f"(channel ID + api_key configurada)."
+            )
+
+        if not api_key:
+            raise RuntimeError(
+                f"Channel ID detectado ({ch_id_clean[:6]}...) mas api_key "
+                f"do YouTube Data API não configurada. Configure a key ou "
+                f"use formato @handle / watch?v= URL."
+            )
+
         import requests
-        channel_id = self.config["streams"]["youtube"]["channel_id"].strip()
-        api_key    = self.config["streams"]["youtube"]["api_key"].strip()
         url = (
             "https://www.googleapis.com/youtube/v3/search"
-            f"?part=id&channelId={channel_id}&eventType=live"
+            f"?part=id&channelId={ch_id_clean}&eventType=live"
             f"&type=video&key={api_key}"
         )
         resp  = requests.get(url, timeout=10)

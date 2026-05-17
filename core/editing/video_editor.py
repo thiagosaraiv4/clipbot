@@ -208,23 +208,23 @@ class VideoEditor:
 
     def _build_ass_header(self) -> str:
         """
-        Header ASS estilo CapCut/TikTok 2024:
-          • PlayRes 1080×1920 (combina com output vertical do ClipBot).
-          • Fonte: Impact (impacto bold) com fallback Arial Black.
-          • Tamanho ~h/22 (mesma escala do title banner).
-          • Branco com outline preto grosso (legível em qualquer background).
-          • PrimaryColour = amarelo: palavras "já faladas" ficam amarelas via \\k.
-          • SecondaryColour = branco: palavras "futuras" começam brancas.
-          • Alignment 2 = bottom-center. MarginV=240 = safe zone TikTok bottom.
+        Header ASS estilo Real Oficial (vertical 9:16 TikTok/Reels).
+          • PlayRes 1080×1920.
+          • Fonte: Impact (heavy bold) com fallback Arial Black.
+          • Tamanho 78 ≈ 4% altura — visível em mobile, não invasivo.
+          • Cor base: AMARELO (palavras padrão — futuras E passadas).
+          • Cor active (verde): aplicada via eventos overlay alpha-mask por
+            palavra em _segments_to_ass (não está no Style).
+          • Alignment 8 = top-center. MarginV = distância do TOPO até o topo
+            do texto. 620 ≈ 32% do topo, deixa centro do texto em ~700 (37%).
         """
         cfg_sub = self.cfg.get("subtitles", {})
         layout  = self.cfg.get("layout_preset", "tiktok")
-        _preset_margins = {"tiktok": 240, "shorts": 220, "reels": 230}
-        margin_v = cfg_sub.get("margin_v") or _preset_margins.get(layout, 240)
+        # MarginV calibrado por preset. Estilo Real Oficial usa centro-superior.
+        _preset_margins = {"tiktok": 620, "shorts": 600, "reels": 610}
+        margin_v = cfg_sub.get("margin_v") or _preset_margins.get(layout, 620)
 
-        # FontSize em ASS: unidade depende de PlayResY. Para 1920 vertical,
-        # fontsize 78 ≈ 78/1920 ≈ 4% da altura = ~h/24. Estilo balanced.
-        font_size = 78
+        font_size = cfg_sub.get("ass_font_size", 78)
 
         return (
             "[Script Info]\n"
@@ -232,36 +232,64 @@ class VideoEditor:
             "PlayResX: 1080\n"
             "PlayResY: 1920\n"
             "ScaledBorderAndShadow: yes\n"
-            "WrapStyle: 2\n"
+            # WrapStyle 0 = smart wrapping (libass quebra automaticamente para
+            # caber dentro de PlayResX - MarginL - MarginR). Antes (WrapStyle 2)
+            # desabilitava quebra → frases longas saíam da tela.
+            "WrapStyle: 0\n"
             "\n"
             "[V4+ Styles]\n"
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
             "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
             "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
             "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-            # PrimaryColour = amarelo (palavras já faladas/atuais)
-            # SecondaryColour = branco (palavras futuras antes do \k)
-            # OutlineColour = preto, Outline=4 (grosso, legível sobre qualquer bg)
-            f"Style: Default,Impact,{font_size},&H0000FFFF,&H00FFFFFF,"
-            f"&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,4,0,2,40,40,{margin_v},1\n"
+            # PrimaryColour = amarelo (&H00BBGGRR — yellow é &H0000FFFF).
+            # SecondaryColour = amarelo idem (não usamos \k clássico mais).
+            # OutlineColour = preto, Outline=3 (mais fino que antes).
+            # Alignment=8 = top-center. MarginV = distância do topo.
+            f"Style: Default,Impact,{font_size},&H0000FFFF,&H0000FFFF,"
+            f"&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,3,0,8,60,60,{margin_v},1\n"
             "\n"
             "[Events]\n"
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
             "MarginV, Effect, Text\n"
         )
 
-    def _segments_to_ass(self, segments: list, ass_path: Path) -> None:
+    @staticmethod
+    def _normalize_word(s: str) -> str:
         """
-        Converte segmentos Whisper (com word_timestamps) para ASS karaoke.
+        Normaliza palavra para matching de subtitle_emojis:
+          • lowercase
+          • remove pontuação ao redor
+          • remove acentos (compatível com keys vindas da LLM sem acento)
+        """
+        import unicodedata
+        s = s.strip().lower().strip(".,!?;:\"'()[]{}…")
+        # Remove diacríticos
+        s = "".join(
+            c for c in unicodedata.normalize("NFD", s)
+            if unicodedata.category(c) != "Mn"
+        )
+        return s
 
-        Cada segment vira UMA linha Dialogue com `{\\k<dur>}` por palavra:
-          • dur em centissegundos = duração da palavra.
-          • Durante o \\k, a palavra está na SecondaryColour (branco).
-          • Após \\k expirar, vira PrimaryColour (amarelo) — efeito "fill-in".
+    def _segments_to_ass(self, segments: list, ass_path: Path,
+                         subtitle_emojis: Optional[dict] = None) -> None:
+        """
+        Converte segmentos Whisper para ASS estilo Real Oficial.
 
-        Fallback se segment não tem `words` (ex: openai-whisper sem word_ts):
-          • Trata o segment inteiro como uma "palavra" (sem karaoke real,
-            mas mantém legenda visível).
+        Estratégia "layered alpha-mask" (verde só na palavra ativa):
+          1. Base event (layer 0): linha INTEIRA em amarelo, dura toda a linha.
+          2. Para cada palavra: 1 event overlay (layer 1) com:
+             • Início/fim alinhado ao timestamp da palavra.
+             • Texto = linha completa com TODAS palavras em \\alpha&HFF& (invisível)
+               EXCETO a palavra ativa em \\alpha&H00&\\1c&H00FF00& (verde opaca).
+             • libass renderiza no MESMO local que a base (alignment idêntico,
+               glyphs invisíveis preservam layout) → a palavra ativa fica
+               sobreposta exatamente em cima da versão amarela.
+          Resultado visual: linha toda amarela, palavra atual flasha verde,
+          volta amarela quando próxima começa. Igual screenshot Real Oficial.
+
+        Fallback se segment não tem `words` (openai-whisper sem word_ts):
+          • Linha plana só em amarelo (sem flash). Visível ainda assim.
         """
         header = self._build_ass_header()
         events = []
@@ -277,30 +305,86 @@ class VideoEditor:
             if seg_end <= seg_start:
                 continue
 
-            if words:
-                # Build text com \k por palavra
-                parts = []
-                for w in words:
-                    raw_w = (w.get("word") or "").strip()
-                    if not raw_w:
-                        continue
-                    w_start = w.get("start", seg_start)
-                    w_end   = w.get("end",   w_start + 0.2)
-                    # Centissegundos (clamp mínimo 1cs para evitar \k0 indefinido)
-                    dur_cs = max(1, int(round((w_end - w_start) * 100)))
-                    parts.append(f"{{\\k{dur_cs}}}{self._escape_ass_text(raw_w)} ")
-                text_line = "".join(parts).rstrip()
-                line_start, line_end = words[0].get("start", seg_start), words[-1].get("end", seg_end)
-            else:
-                # Sem word_timestamps: linha plana sem karaoke
-                text_line = self._escape_ass_text(text)
-                line_start, line_end = seg_start, seg_end
+            # Filtra apenas palavras com texto válido
+            valid_words = [
+                w for w in words if (w.get("word") or "").strip()
+            ] if words else []
 
-            start_str = self._seconds_to_ass_time(line_start)
-            end_str   = self._seconds_to_ass_time(line_end)
-            events.append(
-                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{text_line}\n"
-            )
+            if valid_words:
+                # Normaliza mapa de emojis uma vez (lowercase, sem acento).
+                # LLM já é instruída a retornar keys lowercase sem acento — esse
+                # normalize aqui é defensivo (renormaliza pra garantir match).
+                emoji_map = {}
+                if subtitle_emojis:
+                    for k, v in subtitle_emojis.items():
+                        nk = self._normalize_word(k)
+                        if nk and v:
+                            emoji_map[nk] = v
+
+                # Texto escapado por palavra. Se a palavra bate com uma key do
+                # emoji_map, anexa o emoji adjacente (mesma posição em base
+                # e overlays → layout idêntico, alpha-mask alinha).
+                escaped = []
+                for w in valid_words:
+                    raw = (w.get("word") or "").strip()
+                    e = self._escape_ass_text(raw)
+                    if emoji_map:
+                        norm = self._normalize_word(raw)
+                        em = emoji_map.get(norm)
+                        if em:
+                            e = f"{e} {em}"
+                    escaped.append(e)
+                line_start = valid_words[0].get("start", seg_start)
+                line_end   = valid_words[-1].get("end",   seg_end)
+
+                # ── 1. Base event: linha inteira em amarelo (PrimaryColour default) ──
+                base_text = " ".join(escaped)
+                base_start = self._seconds_to_ass_time(line_start)
+                base_end   = self._seconds_to_ass_time(line_end)
+                events.append(
+                    f"Dialogue: 0,{base_start},{base_end},Default,,0,0,0,,{base_text}\n"
+                )
+
+                # ── 2. Per-word overlay: green flash durante palavra ativa ──
+                for idx, w in enumerate(valid_words):
+                    w_start = w.get("start", line_start)
+                    w_end   = w.get("end",   w_start + 0.2)
+                    if w_end <= w_start:
+                        continue
+
+                    # Linha mascarada: todas \alpha=FF (totalmente invisíveis,
+                    # inclui outline+shadow), exceto idx que recebe:
+                    #   • \1a=00 (primary fill visível)
+                    #   • \3a=00 (outline preto visível — borda do texto)
+                    #   • \1c=&H00FF00 (cor primary verde em BBGGRR)
+                    # Resultado: palavra ativa = green fill + black outline,
+                    # palavras inativas = 100% transparentes (mas ocupam espaço,
+                    # preservando layout idêntico ao base event amarelo).
+                    parts = []
+                    for j, word_txt in enumerate(escaped):
+                        if j == idx:
+                            parts.append(
+                                f"{{\\alpha&HFF&\\1a&H00&\\3a&H00&"
+                                f"\\1c&H00FF00&}}{word_txt}"
+                            )
+                        else:
+                            parts.append(f"{{\\alpha&HFF&}}{word_txt}")
+                    masked = " ".join(parts)
+
+                    ws_str = self._seconds_to_ass_time(w_start)
+                    we_str = self._seconds_to_ass_time(w_end)
+                    events.append(
+                        f"Dialogue: 1,{ws_str},{we_str},Default,,0,0,0,,{masked}\n"
+                    )
+
+            else:
+                # Sem word_timestamps: linha plana amarela (sem flash)
+                text_line = self._escape_ass_text(text)
+                start_str = self._seconds_to_ass_time(seg_start)
+                end_str   = self._seconds_to_ass_time(seg_end)
+                events.append(
+                    f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{text_line}\n"
+                )
 
         ass_path.write_text(header + "".join(events), encoding="utf-8")
 
@@ -453,83 +537,165 @@ class VideoEditor:
             fp = fp[0] + "\\:" + fp[2:]
         return fp
 
-    def _build_title_filter(self, title_text: str) -> str:
-        """Constrói filtro estilo clip (faixa full-width + texto bold grande com sombra)."""
+    @staticmethod
+    def _ffmpeg_movie_path(p: Path) -> str:
+        """
+        Path normalizado para o filtro `movie=` (Windows precisa de escape '\:').
+        Ex: C:\\path\\file.png → C\\:/path/file.png
+        """
+        s = str(p).replace("\\", "/")
+        if len(s) >= 2 and s[1] == ":":
+            s = s[0] + "\\:" + s[2:]
+        return s
+
+    def _resolve_title_font(self) -> str:
+        """Resolve fontfile pro FFmpeg drawtext (cadeia de fallback)."""
         tb_cfg = self.cfg.get("title_banner", {})
-        max_chars = tb_cfg.get("max_chars", 14)
-        wrapped = self._wrap_title(title_text, max_chars=max_chars)
-        escaped = self._escape_drawtext(wrapped)
-
-        # ── Auto-fit fontsize baseado no comprimento do texto ─────────
-        # Impact font em 1080px: cada char ocupa ~fontsize*0.55
-        text_len = len(wrapped)
-        if text_len > 30:
-            fontsize = "h/30"
-        elif text_len > 25:
-            fontsize = "h/26"
-        elif text_len > 20:
-            fontsize = "h/24"
-        elif text_len > 15:
-            fontsize = "h/20"
-        else:
-            fontsize = "h/16"
-
-        # ── Resolução de fonte (cadeia de fallback) ────────────────────
-        # tb_cfg já lido acima
         cfg_font = tb_cfg.get("font_path", "")
-
         font_candidates = [
             cfg_font,
             "C:\\Windows\\Fonts\\impact.ttf",
             "C:\\Windows\\Fonts\\arialbd.ttf",
             "C:\\Windows\\Fonts\\arial.ttf",
         ]
-        resolved_font = None
         for fp in font_candidates:
             if fp and Path(fp).exists():
-                resolved_font = fp
-                break
+                return f"fontfile='{self._ffmpeg_fontfile(fp)}'"
+        return "font='Arial'"
 
-        if resolved_font:
-            font_arg = f"fontfile='{self._ffmpeg_fontfile(resolved_font)}'"
-        else:
-            font_arg = "font='Arial'"
+    def _blob_asset_path(self) -> Optional[Path]:
+        """
+        Retorna path do PNG do blob vermelho (estilo Real Oficial) se existir.
+        None → fallback para faixa retangular drawbox.
+        """
+        # Asset: assets/title_banner_blob.png (gerado por scripts/generate_blob_asset.py)
+        # Procura relativo ao módulo (../../../assets) e relativo ao cwd.
+        candidates = [
+            Path(__file__).resolve().parent.parent.parent / "assets" / "title_banner_blob.png",
+            Path.cwd() / "assets" / "title_banner_blob.png",
+        ]
+        # Permite override por config (editing.title_banner.blob_png)
+        override = self.cfg.get("title_banner", {}).get("blob_png", "")
+        if override:
+            candidates.insert(0, Path(override))
+        for p in candidates:
+            if p.exists():
+                return p
+        return None
 
-        # ── Cores e dimensões configuráveis ────────────────────────────
-        bg_color   = tb_cfg.get("bg_color", "0xCC0000")
-        text_color = tb_cfg.get("text_color", "white")
-        bg_opacity = tb_cfg.get("bg_opacity", 0.92)
+    def _build_title_filter(self, title_text: str,
+                            in_label: str = "pre_title",
+                            out_label: str = "pre_sub") -> list:
+        """
+        Constrói filtros do banner de título.
+
+        Retorna LISTA de steps semicolon-separated (já rotulados).
+        Wire-up no _process_inner faz steps.extend(result) — não precisa replace().
+
+        Modo blob (assets/title_banner_blob.png existe):
+          movie=blob.png [blob] → overlay no topo → drawtext do título por cima
+        Modo legado (sem PNG):
+          drawbox + drawtext (faixa retangular, compatibilidade)
+        """
+        tb_cfg = self.cfg.get("title_banner", {})
+        # max_chars antigo (50) era pra banner 1-linha. Blob 2-line precisa ~18/linha.
+        # Use `line_max_chars` (nova chave) ou cai pra 18 default. Ignora `max_chars`.
+        max_chars  = tb_cfg.get("line_max_chars", 18)
         banner_dur = tb_cfg.get("banner_duration", 5)
+        text_color = tb_cfg.get("text_color", "white")
 
-        # Sanitiza '#RRGGBB' → '0xRRGGBB' (# é comentário no FFmpeg)
+        # Wrap em 2 linhas (Real Oficial usa 2 linhas curtas no blob).
+        # _wrap_title separa por `\\n` literal (FFmpeg drawtext escape), não \n real.
+        wrapped = self._wrap_title(title_text, max_chars=max_chars, max_lines=2)
+        if "\\n" in wrapped:
+            raw_lines = wrapped.split("\\n")
+        else:
+            raw_lines = [wrapped]
+        # Sanitiza por linha; cada drawtext fica com 1 linha sem \n
+        lines = [self._escape_drawtext(l.strip()) for l in raw_lines if l.strip()][:2]
+
+        # Auto-fit fontsize: 2 linhas precisa mais compacto
+        max_line_len = max(len(l) for l in lines) if lines else 1
+        if max_line_len > 22:
+            fontsize_val = 64
+        elif max_line_len > 16:
+            fontsize_val = 78
+        else:
+            fontsize_val = 92
+
+        font_arg = self._resolve_title_font()
+        x_expr = "(w-text_w)/2"
+        enable = f"lt(t\\,{banner_dur})"
+
+        # Posição vertical do banner: 6% do topo (acima das legendas)
+        # 1920 * 0.06 = ~115px do topo. Centro do blob fica ~y=180.
+        blob_top_y = 60        # margem do topo do blob ao topo da tela
+        blob_h = 280           # altura visível do blob (matches asset)
+        # Texto centralizado no centro do blob
+        text_y_center = blob_top_y + blob_h // 2     # = 200
+
+        # Y de cada linha (2 linhas empilhadas centradas no centro do blob)
+        if len(lines) >= 2:
+            y1 = f"({text_y_center} - text_h - 4)"
+            y2 = f"({text_y_center} + 4)"
+        else:
+            y1 = f"({text_y_center} - text_h/2)"
+            y2 = None
+
+        # ── Modo blob (PNG asset existe) ─────────────────────────────────────
+        blob_path = self._blob_asset_path()
+        if blob_path:
+            movie_path = self._ffmpeg_movie_path(blob_path)
+            steps = [
+                # Carrega PNG. ATENÇÃO: `loop=0` em movie filter significa LOOP
+                # INFINITO — trava o pipeline ffmpeg pq overlay nunca recebe EOF
+                # do blob. Default (loop=1, sem flag) = lê o single-frame uma vez,
+                # depois EOF. Overlay default eof_action=repeat → mostra o último
+                # frame indefinidamente, que é exatamente o que queremos.
+                f"movie='{movie_path}',scale=1080:{blob_h}[__blob]",
+                # Overlay do blob sobre o vídeo principal nos primeiros banner_dur seg
+                f"[{in_label}][__blob]overlay=x=(W-w)/2:y={blob_top_y}"
+                f":enable='{enable}'[__blob_bg]",
+            ]
+            # Drawtext linha 1
+            dt1 = (
+                f"[__blob_bg]drawtext={font_arg}:text='{lines[0]}'"
+                f":fontsize={fontsize_val}:fontcolor={text_color}"
+                f":borderw=3:bordercolor=black"
+                f":x={x_expr}:y={y1}"
+                f":enable='{enable}'"
+            )
+            if y2 is None:
+                steps.append(f"{dt1}[{out_label}]")
+            else:
+                steps.append(f"{dt1}[__tline1]")
+                steps.append(
+                    f"[__tline1]drawtext={font_arg}:text='{lines[1]}'"
+                    f":fontsize={fontsize_val}:fontcolor={text_color}"
+                    f":borderw=3:bordercolor=black"
+                    f":x={x_expr}:y={y2}"
+                    f":enable='{enable}'[{out_label}]"
+                )
+            return steps
+
+        # ── Fallback legado: faixa retangular drawbox ────────────────────────
+        # Mantido para builds sem o asset PNG (compatibilidade).
+        bg_color   = tb_cfg.get("bg_color", "0xCC0000")
+        bg_opacity = tb_cfg.get("bg_opacity", 0.92)
         if bg_color.startswith("#"):
             bg_color = "0x" + bg_color[1:]
-
-        # drawbox: h/w são auto-referência do box; usar ih/iw para input
-        # drawtext: h/w referem ao input, então OK
-        strip_h_db = "ih/8"       # drawbox: altura da faixa
-        y_pos_db   = "ih*0.40"    # drawbox: posição Y
-        strip_h_dt = "h/8"        # drawtext: mesma proporção
-        y_pos_dt   = "h*0.40"     # drawtext: mesma posição
-
-        # Margem de segurança: clamp x para nunca vazar nas bordas
-        x_expr = "min(max(40\\,(w-text_w)/2)\\,w-text_w-40)"
-
-        # 1) drawbox: faixa colorida cobrindo 100% da largura (5s)
-        # 2) drawtext: texto grande centralizado na faixa, com sombra (5s)
-        return (
-            f"drawbox=x=0:y={y_pos_db}:w=iw:h={strip_h_db}"
+        line_join = lines[0] if len(lines) == 1 else (lines[0] + "  " + lines[1])
+        chain = (
+            f"drawbox=x=0:y=ih*0.06:w=iw:h=ih/8"
             f":color={bg_color}@{bg_opacity}:t=fill"
-            f":enable='lt(t\\,{banner_dur})',"
-            f"drawtext={font_arg}"
-            f":text='{escaped}'"
-            f":fontsize={fontsize}"
-            f":fontcolor={text_color}"
-            f":shadowcolor=black@0.75:shadowx=4:shadowy=4"
-            f":x={x_expr}"
-            f":y={y_pos_dt}+({strip_h_dt}-text_h)/2"
-            f":enable='lt(t\\,{banner_dur})'"
+            f":enable='{enable}',"
+            f"drawtext={font_arg}:text='{line_join}'"
+            f":fontsize={fontsize_val}:fontcolor={text_color}"
+            f":borderw=3:bordercolor=black"
+            f":x={x_expr}:y=ih*0.06+(ih/8-text_h)/2"
+            f":enable='{enable}'"
         )
+        return [f"[{in_label}]{chain}[{out_label}]"]
 
     # ------------------------------------------------------------------
     # Filtro ffmpeg
@@ -639,20 +805,35 @@ class VideoEditor:
     # ------------------------------------------------------------------
 
     def process(self, input_path: Path, output_name: str,
-                title_text: Optional[str] = None) -> Path:
-        """Processa um clip bruto e retorna o arquivo final editado."""
+                title_text: Optional[str] = None,
+                subtitle_emojis: Optional[dict] = None) -> Path:
+        """
+        Processa um clip bruto e retorna o arquivo final editado.
+
+        Args:
+            input_path:      arquivo raw (.ts/.mp4)
+            output_name:     nome do output sem extensão
+            title_text:      texto do banner de título (opcional)
+            subtitle_emojis: dict palavra_lower → emoji unicode, vindo da LLM
+                             (hook_scorer). Cada palavra do transcript que bater
+                             com uma key recebe o emoji adjacente nas legendas.
+                             None ou {} = sem emojis injetados.
+        """
         output_path = self.out_dir / f"{output_name}.mp4"
         logger.info(f"✂️  Editando: {input_path.name} → {output_path.name}")
-        # Timer end-to-end (inclui commercial detect, whisper, render)
         _t = _Timer("editor.process_total")
         _t.__enter__()
         try:
-            return self._process_inner(input_path, output_path, title_text)
+            return self._process_inner(
+                input_path, output_path, title_text,
+                subtitle_emojis=subtitle_emojis or {},
+            )
         finally:
             _t.__exit__(None, None, None)
 
     def _process_inner(self, input_path: Path, output_path: Path,
-                       title_text: Optional[str] = None) -> Path:
+                       title_text: Optional[str] = None,
+                       subtitle_emojis: Optional[dict] = None) -> Path:
 
         cfg_sub  = self.cfg["subtitles"]
         cfg_wm   = self.cfg["watermark"]
@@ -766,7 +947,24 @@ class VideoEditor:
                     # Fallback SRT é mantido como variável de mesmo nome (srt_path)
                     # para compat com _build_ffmpeg_filter que decide o filter.
                     srt_path = tmp / "subtitles.ass"
-                    self._segments_to_ass(segments, srt_path)
+                    self._segments_to_ass(
+                        segments, srt_path,
+                        subtitle_emojis=subtitle_emojis or {},
+                    )
+                    logger.info(
+                        f"📝 Legendas: {len(segments)} segments → ASS "
+                        f"(language={cfg_sub.get('language','pt')})"
+                    )
+                else:
+                    # Segments vazio = Whisper desistiu (áudio ruim / VAD agressivo /
+                    # filtro hallucination dropou tudo / idioma errado). Clip vai
+                    # renderizar SEM legendas. Avisa no log.
+                    logger.warning(
+                        f"⚠️  Transcrição vazia — clip SEM legendas "
+                        f"(language={cfg_sub.get('language','pt')}). "
+                        f"Causas: áudio com música/jogos, idioma errado "
+                        f"(tente 'auto'), ou clip silencioso."
+                    )
 
             # --- Speaker tracking (Iter2): detecta rosto e propõe crop dinâmico ---
             # Custo: ~3-12s por clip (extract frames sparse + Haar Cascade CPU).
@@ -797,32 +995,48 @@ class VideoEditor:
                 # Modo vertical: fundo blur + vídeo sobreposto
                 steps = flt["complex_steps"].copy()   # split, bg, fg, overlay
 
-                # Pipeline: overlay → title_banner → subtitles
-                # O último step atual termina com [vout]
+                # Pipeline: overlay → title_banner (lista de steps) → subtitles
+                # title_filter agora é list[str] (steps já rotulados in/out)
+                title_steps = flt["title_filter"] or []
+                has_title   = bool(title_steps)
+                has_sub     = bool(flt["sub_filter"])
 
-                if flt["title_filter"] and flt["sub_filter"]:
-                    # Título + legendas: overlay→[pre_title]→title→[pre_sub]→subs→[vout]
+                if has_title and has_sub:
+                    # overlay→[pre_title]→title_steps→[pre_sub]→subs→[vout]
                     steps[-1] = steps[-1].replace("[vout]", "[pre_title]")
-                    steps.append(f"[pre_title]{flt['title_filter']}[pre_sub]")
+                    steps.extend(title_steps)   # já termina em [pre_sub]
                     steps.append(f"[pre_sub]{flt['sub_filter']}[vout]")
-                elif flt["title_filter"]:
-                    # Só título: overlay→[pre_title]→title→[vout]
+                elif has_title:
+                    # title only: precisa fechar em [vout], então rebatiza o último step
                     steps[-1] = steps[-1].replace("[vout]", "[pre_title]")
-                    steps.append(f"[pre_title]{flt['title_filter']}[vout]")
-                elif flt["sub_filter"]:
-                    # Só legendas (comportamento original)
+                    # Substitui [pre_sub] → [vout] no último step do banner
+                    title_steps = list(title_steps)
+                    title_steps[-1] = title_steps[-1].replace("[pre_sub]", "[vout]")
+                    steps.extend(title_steps)
+                elif has_sub:
                     steps[-1] = steps[-1].replace("[vout]", "[pre_sub]")
                     steps.append(f"[pre_sub]{flt['sub_filter']}[vout]")
 
                 filter_complex = ";".join(steps)
                 cmd += ["-filter_complex", filter_complex, "-map", "[vout]", "-map", "0:a?"]
             else:
-                # Modo horizontal simples
+                # Modo horizontal simples — modo blob (movie=) só faz sentido em
+                # complex graph. Para vf simples, _build_title_filter precisa
+                # retornar string única. Solução: usar fallback drawbox.
                 vf_parts = []
                 if flt["simple_vf"]:
                     vf_parts.append(flt["simple_vf"])
                 if flt["title_filter"]:
-                    vf_parts.append(flt["title_filter"])
+                    # title_filter é lista; extrai chain "interno" do fallback drawbox.
+                    # Steps fallback têm formato "[in]chain[out]" — pega só o chain.
+                    for s in flt["title_filter"]:
+                        # Remove labels [in]...[out] do step para uso em -vf
+                        import re as _re
+                        m = _re.match(r"^\[[^\]]+\](.*?)\[[^\]]+\]$", s)
+                        if m:
+                            vf_parts.append(m.group(1))
+                        else:
+                            vf_parts.append(s)
                 if flt["sub_filter"]:
                     vf_parts.append(flt["sub_filter"])
                 vf = ",".join(vf_parts)

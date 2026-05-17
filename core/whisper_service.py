@@ -59,6 +59,11 @@ class WhisperService:
         self.device     = device
         self._model     = None
         self._load_lock = threading.Lock()
+        # CRITICAL: faster-whisper model.transcribe NÃO é thread-safe — duas
+        # chamadas paralelas no MESMO modelo CUDA corrompem state (segments
+        # iterator vazio, segfault em ctranslate2). Lock serializa transcribe.
+        # GPU single-stream é gargalo anyway; perda < 5% throughput.
+        self._transcribe_lock = threading.Lock()
         self._backend:  Optional[str] = None
 
     # ── Carga lazy com cascata de backends ────────────────────────────────────
@@ -174,30 +179,50 @@ class WhisperService:
         Transcreve audio_path. Retorna formato openai-whisper:
             {"segments": [...], "text": "..."}
 
-        Implementação interna decide entre faster-whisper e openai-whisper.
-        Adapter de formato garante compat com callers existentes.
+        language="auto" (ou None/"") → faster-whisper auto-detecta idioma
+        do clip. Útil pra canais multilíngues (ex: streamer EN num clip,
+        outro PT em outro clip). Custa ~1s extra na primeira inferência
+        pra detection; depois é cached.
 
         Defaults otimizados para clips curtos:
           • beam_size=1 (~3.5× mais rápido que default 5, queda <1% WER)
-          • condition_on_previous_text=False
+          • condition_on_previous_text=False (evita loop autorregressivo)
           • temperature=0.0 (determinístico)
-          • word_timestamps=False (custo extra ~30%)
         """
         self._ensure_loaded()
 
-        if self._backend.startswith("faster-whisper"):
-            return self._transcribe_faster(
-                audio_path, language=language,
-                word_timestamps=word_timestamps, beam_size=beam_size,
-            )
-        else:
-            return self._transcribe_openai(
-                audio_path, language=language,
-                word_timestamps=word_timestamps, beam_size=beam_size,
-            )
+        # Auto-detect: faster-whisper aceita language=None
+        lang = None if language in ("auto", None, "") else language
+
+        # Serializa transcribe (faster-whisper não é thread-safe)
+        with self._transcribe_lock:
+            if self._backend.startswith("faster-whisper"):
+                return self._transcribe_faster(
+                    audio_path, language=lang,
+                    word_timestamps=word_timestamps, beam_size=beam_size,
+                )
+            else:
+                return self._transcribe_openai(
+                    audio_path, language=lang,
+                    word_timestamps=word_timestamps, beam_size=beam_size,
+                )
 
     def _transcribe_faster(self, audio_path, *, language, word_timestamps, beam_size) -> dict:
-        """faster-whisper retorna iterator; convertemos para dict format."""
+        """
+        faster-whisper retorna iterator; convertemos para dict format.
+
+        Anti-hallucination (clipbot v2.5):
+          • compression_ratio_threshold=1.8: dropa segments com texto altamente
+            repetitivo (caso clássico "do sinal do sinal..." tem compression ratio
+            ~3.5). Default 2.4 deixa passar; 1.8 catch agressivo.
+          • no_speech_threshold=0.7: dropa segments onde prob "sem fala" > 0.7
+            (default 0.6 — 0.7 é mais agressivo, melhor pra background music).
+          • log_prob_threshold=-0.8: dropa segments com confiança baixa
+            (default -1.0 = 36% prob; -0.8 = 45% prob, mais exigente).
+          • vad_parameters: min_silence 500ms (filtra silêncios pequenos antes
+            do Whisper sequer ver).
+          • Post-process: detecta loop "AAA AAA AAA" e dropa segment.
+        """
         segments_iter, info = self._model.transcribe(
             str(audio_path),
             language=language,
@@ -206,10 +231,32 @@ class WhisperService:
             condition_on_previous_text=False,
             temperature=0.0,
             word_timestamps=word_timestamps,
-            vad_filter=True,    # pula silêncio gratuito; reduz alucinações
+            vad_filter=True,
+            compression_ratio_threshold=1.8,
+            no_speech_threshold=0.7,
+            log_prob_threshold=-0.8,
+            vad_parameters=dict(min_silence_duration_ms=500),
         )
+        # Log idioma detectado (útil em modo language=None/auto)
+        try:
+            logger.debug(
+                f"   lang={info.language} prob={info.language_probability:.2f} "
+                f"duration={info.duration:.1f}s"
+            )
+        except Exception:
+            pass
+
         segments_list = []
+        dropped_loop  = 0
         for s in segments_iter:
+            text = (s.text or "").strip()
+            if not text:
+                continue
+            # Post-process: detecta loop autorregressivo ("do sinal do sinal...")
+            if self._is_hallucination_loop(text):
+                dropped_loop += 1
+                logger.debug(f"   ⚠️  hallucination loop dropped: {text[:60]!r}...")
+                continue
             seg = {
                 "id":    getattr(s, "id", len(segments_list)),
                 "start": float(s.start),
@@ -222,8 +269,42 @@ class WhisperService:
                     for w in s.words
                 ]
             segments_list.append(seg)
+        if dropped_loop:
+            logger.info(f"🚫 Whisper hallucination filter: dropped {dropped_loop} loop segment(s)")
         full_text = " ".join(s["text"].strip() for s in segments_list)
         return {"segments": segments_list, "text": full_text, "language": info.language}
+
+    @staticmethod
+    def _is_hallucination_loop(text: str) -> bool:
+        """
+        Heurística de detecção de loop autorregressivo.
+        Whisper, com áudio ambíguo (música, silêncio, ruído), entra em loops
+        do tipo "do sinal do sinal do sinal..." ou "obrigado obrigado obrigado".
+        Critérios cumulativos (qualquer um TRUE → é loop):
+
+        1. Top-1 palavra repete ≥40% do total das palavras
+           (5+ palavras + ratio alto)
+        2. Top bigram (par de palavras) repete ≥30% do total dos bigramas
+           ("do sinal" × 10 num texto de 20 palavras = 50% → loop)
+        """
+        words = text.lower().split()
+        n = len(words)
+        if n < 5:
+            return False
+        # Regra 1: monopalavra
+        from collections import Counter
+        cnt = Counter(words)
+        top_word, top_count = cnt.most_common(1)[0]
+        if top_count / n >= 0.40:
+            return True
+        # Regra 2: bigrama dominante
+        if n >= 6:
+            bigrams = [f"{words[i]} {words[i+1]}" for i in range(n - 1)]
+            bc = Counter(bigrams)
+            top_bg, top_bg_count = bc.most_common(1)[0]
+            if top_bg_count / len(bigrams) >= 0.30:
+                return True
+        return False
 
     def _transcribe_openai(self, audio_path, *, language, word_timestamps, beam_size) -> dict:
         return self._model.transcribe(

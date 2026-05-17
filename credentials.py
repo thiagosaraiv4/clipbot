@@ -99,7 +99,9 @@ def _default_settings() -> dict:
         },
         "editing": {
             "subtitles": True,
-            "language":  "pt",
+            # "auto" = Whisper detecta idioma por clip (recomendado p/ multi-canal).
+            # Force "pt"/"en"/"es" se todos os canais falam o mesmo idioma.
+            "language":  "auto",
             "watermark": False,
             "watermark_text": "",
             "format":    "vertical",

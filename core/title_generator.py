@@ -110,6 +110,18 @@ class TitleGenerator:
         self.use_whisper = tb_cfg.get("use_whisper_title", True)
         self.max_title_len = tb_cfg.get("max_chars", 50)
 
+        # Metadata da última geração (set por generate() quando LLM responde).
+        # Caller (bot_engine) pode ler estes pra passar p/ video_editor:
+        #   • last_subtitle_emojis: dict palavra_lower → emoji unicode
+        #   • last_hashtags:        list[str]
+        #   • last_viral_score:     float [0..1]
+        # Reset a cada generate(). Vazio se cascata caiu pra template.
+        self.last_subtitle_emojis: dict = {}
+        self.last_hashtags:        list = []
+        self.last_viral_score:     float = 0.0
+        self.last_hook:            str  = ""
+        self.last_provider:        str  = ""
+
     # ──────────────────────────────────────────────────────────────────────
     # Estratégia A: Whisper micro-transcrição (primeiros 5s)
     # ──────────────────────────────────────────────────────────────────────
@@ -298,12 +310,27 @@ class TitleGenerator:
         extra    = moment_entry.get("extra", {})
         channel  = moment_entry.get("channel", "")
 
+        # Reset metadata da geração anterior (LLM-only fields).
+        self.last_subtitle_emojis = {}
+        self.last_hashtags = []
+        self.last_viral_score = 0.0
+        self.last_hook = ""
+        self.last_provider = ""
+
         # ── Estratégia 0: LLM Hook Scorer (Iter2 PR3) ─────────────────
         # Acima do Whisper micro: usa transcrição completa + contexto editorial.
         # Sem API key configurada → is_available()=False, cai para próximo.
         try:
             from hook_scorer import HookScorer
-            if HookScorer.is_available() and self.use_whisper and raw_clip.exists():
+            _llm_ok    = HookScorer.is_available()
+            _whisp_ok  = self.use_whisper
+            _clip_ok   = raw_clip.exists()
+            logger.info(
+                f"🔎 LLM Strategy 0 gate: llm_available={_llm_ok} "
+                f"use_whisper={_whisp_ok} clip_exists={_clip_ok} "
+                f"providers={HookScorer.available_providers()}"
+            )
+            if _llm_ok and _whisp_ok and _clip_ok:
                 # Reusa Whisper singleton para obter transcrição (já carregado por
                 # video_editor neste ponto do pipeline; warm ~2s).
                 from whisper_service import WhisperService
@@ -328,8 +355,17 @@ class TitleGenerator:
                     )
                     if score_result and score_result.get("title"):
                         llm_title = score_result["title"]
-                        logger.info(f"✨ Título via LLM: \"{llm_title}\" "
-                                    f"(viral={score_result['viral_score']:.2f})")
+                        # Captura metadata p/ video_editor consumir
+                        self.last_subtitle_emojis = score_result.get("subtitle_emojis") or {}
+                        self.last_hashtags        = score_result.get("hashtags") or []
+                        self.last_viral_score     = score_result.get("viral_score", 0.0)
+                        self.last_hook            = score_result.get("hook") or ""
+                        self.last_provider        = score_result.get("provider", "")
+                        logger.info(
+                            f"✨ Título via LLM[{self.last_provider}]: \"{llm_title}\" "
+                            f"(viral={self.last_viral_score:.2f}, "
+                            f"emojis={len(self.last_subtitle_emojis)})"
+                        )
                         return llm_title
         except Exception as e:
             logger.debug(f"LLM hook scorer falhou: {e}")
