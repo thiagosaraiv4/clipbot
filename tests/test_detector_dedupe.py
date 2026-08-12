@@ -73,14 +73,39 @@ def test_dedupe_holds_for_any_buffer_after(buffer_after):
 
 def test_distinct_events_are_not_merged_away():
     """
-    INVARIANTE: dois floods separados por bastante tempo continuam sendo
-    DOIS momentos. O patch não pode deduplicar demais.
+    INVARIANTE: dois floods separados continuam sendo DOIS momentos —
+    o dedupe não pode agregar demais.
+
+    Intervalo escolhido (120s) fica DELIBERADAMENTE entre a janela de dedupe
+    (15s) e o TTL de poda (_MOMENT_TTL_SEC=300s), isolando a variável sob teste.
+    Com 600s, o primeiro evento seria descartado pela poda por idade — e o teste
+    mediria o TTL, não o dedupe. (Antes do patch este assert passava por acidente,
+    satisfeito pelos momentos duplicados do segundo burst.)
     """
     det, ref = _detector()
     _burst(det, ref, n_msgs=40, wall_seconds=1.0)
 
-    ref[0] += 600.0                       # 10 minutos depois
+    ref[0] += 120.0                       # 2 min: >> dedupe(15s), << TTL(300s)
     _burst(det, ref, n_msgs=40, wall_seconds=1.0)
 
     flood = [m for m in det.get_moments_snapshot() if m.reason == "chat_flood"]
     assert len(flood) >= 2, "eventos distantes foram colapsados — perda de clips"
+
+
+def test_old_moments_are_pruned_by_ttl():
+    """
+    Comportamento pré-existente da poda (documentado aqui para não regredir):
+    momentos com end_sec anterior a (elapsed - TTL) somem do snapshot.
+    """
+    from moment_detector import TwitchChatDetector
+
+    det, ref = _detector()
+    _burst(det, ref, n_msgs=40, wall_seconds=1.0)
+    assert det.get_moments_snapshot(), "primeiro evento deveria existir"
+
+    ref[0] += TwitchChatDetector._MOMENT_TTL_SEC + 60.0   # além do TTL
+    _burst(det, ref, n_msgs=40, wall_seconds=1.0)
+
+    flood = [m for m in det.get_moments_snapshot() if m.reason == "chat_flood"]
+    assert len(flood) == 1, "momento antigo deveria ter sido podado pelo TTL"
+    assert flood[0].start_sec > 300.0

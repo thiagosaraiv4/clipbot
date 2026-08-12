@@ -656,7 +656,12 @@ class BotEngine:
                 backoff_s = min(_RETRY_BACKOFF_MAX, backoff_s * _RETRY_BACKOFF_MULT)
                 continue
 
-            detector = MomentDetector(cfg, elapsed_fn=capture.get_elapsed_seconds)
+            # platform/channel explícitos: o detector de chat da Twitch só é
+            # criado para threads da Twitch, no canal DESTA thread (P1-4).
+            detector = MomentDetector(
+                cfg, elapsed_fn=capture.get_elapsed_seconds,
+                platform=platform, channel=channel,
+            )
             detector.start(raw_file)
 
             approval_mode  = config.get("system", {}).get("approval_mode", False)

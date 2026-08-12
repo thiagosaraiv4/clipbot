@@ -22,6 +22,7 @@ import atexit
 import hashlib
 import logging
 import threading
+import weakref
 from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional, Callable
@@ -61,6 +62,33 @@ def _kill_proc(proc, timeout: float = 3.0) -> None:
             pass
     except Exception:
         pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cleanup global de detectores de áudio (registro ÚNICO no import do módulo)
+#
+# P1-10: antes, cada AudioSpikeDetector fazia atexit.register(self._atexit_cleanup)
+# no __init__. atexit guarda referência FORTE → a instância nunca era coletada.
+# Com o auto-restart por canal (PR7), cada reconexão vazava um detector com sua
+# lista de momentos, session e proc. Medido: 30 restarts → 30 instâncias vivas.
+#
+# WeakSet permite que o GC recolha detectores descartados, mantendo a garantia
+# de matar processos FFmpeg pendentes no encerramento do app.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_active_audio_detectors: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _cleanup_all_audio_detectors() -> None:
+    """Encerra sessions/procs de todos os detectores de áudio ainda vivos."""
+    for det in list(_active_audio_detectors):
+        try:
+            det._atexit_cleanup()
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_all_audio_detectors)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -132,8 +160,9 @@ class AudioSpikeDetector:
         self._proc      = None              # alias do session.proc — usado por _pipe_reader
         self._session: Optional[FFmpegSession] = None
 
-        # Registra atexit UMA única vez, apontando para o estado mutável
-        atexit.register(self._atexit_cleanup)
+        # Cleanup no encerramento via WeakSet de módulo (não atexit.register
+        # por instância — isso retinha o objeto para sempre, ver P1-10).
+        _active_audio_detectors.add(self)
 
     def _atexit_cleanup(self) -> None:
         """Chamado via atexit: encerra session/proc atual (se houver)."""
@@ -418,6 +447,7 @@ class TwitchChatDetector:
     _STABLE_SESSION_SEC    = 60.0      # connection ≥ 60s reseta backoff
     _MSG_TIMES_MAXLEN      = 2000      # bound contra burst absurdo
     _MOMENT_TTL_SEC        = 300.0     # poda momentos com end_sec < elapsed-300s
+    _DEDUPE_WINDOW_SEC     = 15.0      # gatilhos da mesma reason dentro disso = 1 evento
 
     # Socket timeouts
     _CONNECT_TIMEOUT_SEC   = 10.0
@@ -446,12 +476,21 @@ class TwitchChatDetector:
                 s = s.split(sep, 1)[0]
         return s.strip()
 
-    def __init__(self, config: dict, elapsed_fn: Callable[[], float]):
+    def __init__(self, config: dict, elapsed_fn: Callable[[], float],
+                 channel: str = None):
+        """
+        channel: canal desta thread (explícito). Se None, resolve do config —
+        primeiro `streams.twitch.channel` (setado por _monitor_platform para a
+        plataforma monitorada) e só então o fallback `channels[0]`.
+        Passar explicitamente é o caminho correto: o fallback para channels[0]
+        era o que fazia threads de outras plataformas ouvirem o canal errado.
+        """
         self.cfg_flood  = config["detection"]["chat_flood"]
         self.cfg_kw     = config["detection"]["keywords"]
         self.keywords   = [k.lower() for k in self.cfg_kw.get("words", [])]
         self.elapsed_fn = elapsed_fn
         raw_channel    = (
+            channel or
             config["streams"]["twitch"].get("channel") or
             (config["streams"]["twitch"].get("channels") or [""])[0]
         )
@@ -461,6 +500,8 @@ class TwitchChatDetector:
         # bound contra burst extremo (cleanup janela ainda roda em _process_message)
         self._msg_times: deque = deque(maxlen=self._MSG_TIMES_MAXLEN)
         self._kw_times:  deque = deque()
+        # reason → csec do último gatilho aceito (base do dedupe, ver _add_moment)
+        self._last_trigger: dict = {}
         self._baseline_rate: float = 0.0
         self._rate_samples: deque = deque(maxlen=60)
 
@@ -759,11 +800,24 @@ class TwitchChatDetector:
 
     def _add_moment(self, reason: str, csec: float, buf_before: float,
                     buf_after: float, keywords=None, score: float = 1.0) -> None:
+        """
+        Dedupe por instante do GATILHO (P1-5).
+
+        Bug anterior: comparava `abs(m.end_sec - csec) < 15`, misturando
+        referenciais — `end_sec` já inclui `buffer_after`, então a diferença era
+        ~buffer_after (20s por padrão) e o teste 20 < 15 nunca era satisfeito:
+        o dedupe ficava permanentemente desligado. Medido: 60 mensagens em 1s
+        geravam 31 momentos chat_flood + 7 keyword.
+
+        Agora rastreamos o csec do último gatilho por reason — invariante ao
+        valor dos buffers. A varredura em `_moments[-5:]` também saía pela
+        janela sob flood misto; `_last_trigger` não tem esse limite.
+        """
         with self._lock:
-            # Dedup: ignora duplicatas da mesma razão em <15s
-            for m in self._moments[-5:]:
-                if m.reason == reason and abs(m.end_sec - csec) < 15:
-                    return
+            last = self._last_trigger.get(reason)
+            if last is not None and (csec - last) < self._DEDUPE_WINDOW_SEC:
+                return
+            self._last_trigger[reason] = csec
             m = Moment(
                 start_sec = max(0.0, csec - buf_before),
                 end_sec   = csec + buf_after,
@@ -1033,9 +1087,26 @@ class MomentDetector:
 
     MERGE_DIST = 15.0   # segundos após o fim do grupo para atrair o próximo
 
-    def __init__(self, config: dict, elapsed_fn: Callable[[], float]):
+    # Teto de duração de um momento fundido. Default = clip_max_sec padrão (60s).
+    # P1-6: "max_clip_duration" existia no config e nunca era lido; flood
+    # contínuo produzia momentos de 82-340s em produção.
+    MAX_MOMENT_DURATION = 60.0
+
+    def __init__(self, config: dict, elapsed_fn: Callable[[], float],
+                 platform: str = None, channel: str = None):
+        """
+        platform/channel: identidade da thread que criou este detector.
+        Passá-los é o caminho correto (bot_engine._monitor_platform faz isso).
+
+        P1-4: antes, o chat da Twitch era criado sempre que `streams.twitch`
+        estivesse habilitado, sem olhar a plataforma monitorada — threads de
+        Kick/YouTube abriam IRC no primeiro canal Twitch da lista e atribuíam
+        os momentos daquele chat ao canal errado.
+        """
         self.config     = config
         self.elapsed_fn = elapsed_fn
+        self.platform   = platform
+        self.channel    = channel
         self._detectors = []
 
         det = config["detection"]
@@ -1046,11 +1117,18 @@ class MomentDetector:
             self._detectors.append(self.audio)
 
         self.chat = None
-        if config["streams"]["twitch"]["enabled"] and (
-            det["chat_flood"]["enabled"] or det["keywords"]["enabled"]
-        ):
-            self.chat = TwitchChatDetector(config, elapsed_fn)
+        if self._twitch_chat_applies(config, platform):
+            self.chat = TwitchChatDetector(config, elapsed_fn, channel=channel)
             self._detectors.append(self.chat)
+
+        # Teto de duração: usa o config quando disponível
+        try:
+            self._max_duration = float(
+                det["audio_spike"].get("max_clip_duration")
+                or self.MAX_MOMENT_DURATION
+            )
+        except Exception:
+            self._max_duration = self.MAX_MOMENT_DURATION
 
         self.sim = None
         if det.get("sim_racing", {}).get("enabled", False):
@@ -1062,6 +1140,27 @@ class MomentDetector:
         if det["manual_timestamps"]["enabled"]:
             self.manual = ManualTimestampDetector(config)
             self.manual.load()
+
+    @staticmethod
+    def _twitch_chat_applies(config: dict, platform: Optional[str]) -> bool:
+        """
+        O chat IRC da Twitch só vale para uma thread que monitora a Twitch.
+
+        • platform explícito  → só "twitch" habilita (caminho do bot_engine).
+        • platform None       → compat: exige que ESTA config aponte um canal
+          Twitch concreto (`streams.twitch.channel`), que é o que
+          _monitor_platform seta apenas para a plataforma monitorada.
+          O fallback antigo para `channels[0]` não habilita mais nada sozinho.
+        """
+        det = config["detection"]
+        if not (det["chat_flood"]["enabled"] or det["keywords"]["enabled"]):
+            return False
+        tw = config["streams"].get("twitch", {})
+        if not tw.get("enabled"):
+            return False
+        if platform is not None:
+            return platform == "twitch"
+        return bool((tw.get("channel") or "").strip())
 
     def start(self, stream_file: Path = None) -> None:
         if self.audio and stream_file:
@@ -1089,20 +1188,28 @@ class MomentDetector:
                 moments.extend(src.get_moments_snapshot())
 
         moments.sort(key=lambda m: m.start_sec)
-        return self._merge_moments(moments)
+        return self._merge_moments(
+            moments, max_duration=getattr(self, "_max_duration", None)
+        )
 
     # ── Algoritmo de merge (sweep-line) ──────────────────────────────────────
 
     @staticmethod
-    def _merge_moments(moments: List[Moment]) -> List[Moment]:
+    def _merge_moments(moments: List[Moment],
+                       max_duration: float = None) -> List[Moment]:
         """
         Sweep-line: acumula grupo enquanto próximo momento tiver overlap
         OU start <= end_do_grupo + MERGE_DIST.
+
+        max_duration (P1-6): teto do momento resultante. Default = 60s
+        (clip_max_sec padrão). Sem ele, flood contínuo encadeava grupos sem
+        limite — produção registrou 82s e 136s.
         """
         if not moments:
             return []
 
-        DIST   = MomentDetector.MERGE_DIST
+        DIST    = MomentDetector.MERGE_DIST
+        max_dur = float(max_duration or MomentDetector.MAX_MOMENT_DURATION)
         result: List[Moment] = []
 
         group:     List[Moment] = [moments[0]]
@@ -1114,23 +1221,56 @@ class MomentDetector:
                 group.append(m)
                 group_end = max(group_end, m.end_sec)
             else:
-                result.append(MomentDetector._collapse(group))
+                result.append(MomentDetector._collapse(group, max_dur))
                 group     = [m]
                 group_end = m.end_sec
 
-        result.append(MomentDetector._collapse(group))
+        result.append(MomentDetector._collapse(group, max_dur))
         return result
 
     @staticmethod
-    def _collapse(group: List[Moment]) -> Moment:
-        """Reduz um grupo de momentos a um único Moment."""
-        if len(group) == 1:
-            return group[0]
+    def _collapse(group: List[Moment], max_dur: float = None) -> Moment:
+        """
+        Reduz um grupo de momentos a um único Moment, respeitando o teto.
 
-        reasons = {m.reason for m in group}
-        merged  = Moment(
-            start_sec = min(m.start_sec for m in group),
-            end_sec   = max(m.end_sec   for m in group),
+        Quando o grupo excede max_dur, a janela é centrada no momento de MAIOR
+        score do grupo (o núcleo do evento) — preserva o melhor conteúdo em vez
+        de truncar cegamente o início ou o fim.
+        """
+        max_dur = float(max_dur or MomentDetector.MAX_MOMENT_DURATION)
+
+        if len(group) == 1:
+            m = group[0]
+            if m.duration <= max_dur:
+                return m          # passthrough: mantém o moment_id original
+            # Momento único longo demais (ex.: buffers largos): corta do início
+            return Moment(
+                start_sec=m.start_sec, end_sec=m.start_sec + max_dur,
+                reason=m.reason, score=m.score,
+                keywords=list(m.keywords), extra=dict(m.extra),
+            )
+
+        reasons   = {m.reason for m in group}
+        g_start   = min(m.start_sec for m in group)
+        g_end     = max(m.end_sec   for m in group)
+        start, end = g_start, g_end
+
+        if (g_end - g_start) > max_dur:
+            best   = max(group, key=lambda m: m.score)
+            center = (best.start_sec + best.end_sec) / 2.0
+            start  = max(g_start, center - max_dur / 2.0)
+            end    = start + max_dur
+            if end > g_end:                      # colou no fim do grupo
+                end   = g_end
+                start = max(g_start, end - max_dur)
+            logger.debug(
+                f"✂️  Momento truncado {g_end - g_start:.0f}s → {end - start:.0f}s "
+                f"(teto={max_dur:.0f}s, centrado no pico score={best.score:.2f})"
+            )
+
+        merged = Moment(
+            start_sec = start,
+            end_sec   = end,
             reason    = "super_moment" if len(reasons) > 1 else group[0].reason,
             score     = min(1.0, sum(m.score for m in group)),
             keywords  = list({kw for m in group for kw in m.keywords}),
@@ -1138,6 +1278,7 @@ class MomentDetector:
                 "reasons": sorted(reasons),
                 "sources": sorted({m.reason for m in group}),
                 "count":   len(group),
+                "span_sec": round(g_end - g_start, 1),   # duração antes do teto
             },
         )
         if len(reasons) > 1:
