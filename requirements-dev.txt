@@ -1,0 +1,9 @@
+# ─────────────────────────────────────────────────────────────────
+# ClipBot — dependências de desenvolvimento/teste
+# Instale com:  pip install -r requirements-dev.txt
+#
+# A suíte em tests/ é hermética: sem rede, GPU, FFmpeg, Whisper ou
+# acesso ao %APPDATA% real (isolado em tests/conftest.py).
+# ─────────────────────────────────────────────────────────────────
+
+pytest>=8.0.0

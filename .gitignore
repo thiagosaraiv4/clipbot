@@ -39,3 +39,6 @@ raw_*.ts
 
 # Gemini artifacts
 .gemini/
+
+# Testes
+.pytest_cache/
