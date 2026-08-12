@@ -211,11 +211,20 @@ class ClipBotAPI:
 
     def get_status(self) -> dict:
         running = bool(self._engine and self._engine.is_running)
-        return {
+        status = {
             "running":     running,
             "clips_today": self._engine.clips_today if self._engine else 0,
             "clips_total": self._engine.clips_total if self._engine else 0,
+            "channels":    {},
         }
+        # Funil + heartbeat por canal (Patch 10). Nunca deixa get_status falhar:
+        # a UI depende dele para saber se o engine está vivo.
+        if self._engine:
+            try:
+                status["channels"] = self._engine.get_health()
+            except Exception as e:
+                logger.debug(f"get_health: {e}")
+        return status
 
     def start_engine(self) -> dict:
         if self._engine and self._engine.is_running:

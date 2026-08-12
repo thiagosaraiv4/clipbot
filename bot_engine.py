@@ -91,6 +91,11 @@ class BotEngine:
         self._output_dir: Path = None
         self._clips_dir:  Path = None
 
+        # ── Observabilidade: funil + heartbeat por canal (Patch 10) ───────────
+        # Responde "o bot está vivo mas não gera clips?" sem depender de log.
+        self._channel_health: dict = {}
+        self._health_lock = threading.Lock()
+
         # ── Log handler ───────────────────────────────────────────────────────
         handler = QueueHandler(self._log_queue)
         handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%H:%M:%S"))
@@ -123,6 +128,123 @@ class BotEngine:
         while not self._log_queue.empty():
             messages.append(self._log_queue.get_nowait())
         return messages
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Observabilidade: funil de momentos + heartbeat por canal (Patch 10)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # Estágios do funil, em ordem de pipeline. Um momento que chega ao fim
+    # passou por: detected → extracted → rendered → published.
+    # Qualquer "gate" é uma saída (descarte) — a soma dos gates + rendered
+    # deve reconciliar com detected (a menos dos que ainda estão em voo).
+    FUNNEL_STAGES = (
+        "detected",        # momento único, maduro, entrou no pipeline
+        "score_gate",      # descartado: score avançado < 0.15
+        "reaction_gate",   # descartado: score efetivo (reaction) < 0.10
+        "extracted",       # segmento .ts extraído com sucesso
+        "offline_gate",    # descartado: tela offline/placeholder
+        "quality_gate",    # descartado: silêncio + estático
+        "editor_discard",  # descartado pelo editor (comercial / blacklist)
+        "rendered",        # clip final gerado
+        "published",       # upload confirmado em >=1 plataforma
+        "pending_queued",  # (approval-mode) enfileirado para aprovação
+        "errors",          # exceção no processamento do momento
+    )
+
+    def _new_health(self) -> dict:
+        now = time.time()
+        return {
+            "state":          "starting",   # starting|capturing|frozen|reconnecting|stopped
+            "started_at":     now,
+            "last_tick":      now,          # loop do canal vivo
+            "last_moment":    None,         # último momento detectado
+            "last_clip":      None,         # último clip renderizado
+            "attempt":        1,            # nº da tentativa de captura
+            "funnel":         {s: 0 for s in self.FUNNEL_STAGES},
+            "moments_active": 0,            # tamanho do snapshot atual (gauge)
+        }
+
+    def _funnel(self, label: str, stage: str, n: int = 1,
+                platform: str = "", channel: str = "") -> None:
+        """
+        Incrementa um estágio do funil do canal e emite a métrica.
+        Nunca lança — observabilidade jamais derruba produção.
+        """
+        try:
+            with self._health_lock:
+                h = self._channel_health.setdefault(label, self._new_health())
+                h["funnel"][stage] = h["funnel"].get(stage, 0) + n
+                now = time.time()
+                h["last_tick"] = now
+                if stage == "detected":
+                    h["last_moment"] = now
+                elif stage == "rendered":
+                    h["last_clip"] = now
+            _metrics_incr(f"funnel.{stage}", n=n,
+                          platform=platform or "?", channel=channel or label)
+        except Exception:
+            pass
+
+    def _touch_channel(self, label: str, **fields) -> None:
+        """Atualiza heartbeat/estado do canal (state, attempt, moments_active)."""
+        try:
+            with self._health_lock:
+                h = self._channel_health.setdefault(label, self._new_health())
+                h["last_tick"] = time.time()
+                h.update(fields)
+        except Exception:
+            pass
+
+    def get_health(self) -> dict:
+        """
+        Snapshot serializável do funil + heartbeat de todos os canais.
+        Consumido pela UI (get_status) e pelo resumo periódico de log.
+
+        Campos derivados (idades em segundos) evitam que o consumidor
+        precise saber o relógio do engine.
+        """
+        now = time.time()
+        out = {}
+        with self._health_lock:
+            for label, h in self._channel_health.items():
+                out[label] = {
+                    "state":            h["state"],
+                    "attempt":          h["attempt"],
+                    "uptime_sec":       round(now - h["started_at"], 1),
+                    "tick_age_sec":     round(now - h["last_tick"], 1),
+                    "moment_age_sec":   (round(now - h["last_moment"], 1)
+                                         if h["last_moment"] else None),
+                    "clip_age_sec":     (round(now - h["last_clip"], 1)
+                                         if h["last_clip"] else None),
+                    "moments_active":   h["moments_active"],
+                    "funnel":           dict(h["funnel"]),
+                }
+        return out
+
+    def _log_health_summary(self) -> None:
+        """
+        Resumo periódico no log — a resposta rápida para
+        "está rodando, mas por que não saiu clip?".
+        """
+        health = self.get_health()
+        if not health:
+            return
+        for label, h in health.items():
+            f = h["funnel"]
+            gates = (
+                f"score={f['score_gate']} reaction={f['reaction_gate']} "
+                f"offline={f['offline_gate']} quality={f['quality_gate']} "
+                f"editor={f['editor_discard']}"
+            )
+            last_clip = (f"{h['clip_age_sec']:.0f}s atrás"
+                         if h["clip_age_sec"] is not None else "nenhum")
+            logger.info(
+                f"📊 [{label}] {h['state']} up={h['uptime_sec']/60:.0f}min | "
+                f"detected={f['detected']} → extracted={f['extracted']} → "
+                f"rendered={f['rendered']} → published={f['published']} | "
+                f"descartes: {gates} | erros={f['errors']} | "
+                f"ativos={h['moments_active']} | último clip: {last_clip}"
+            )
 
     # ──────────────────────────────────────────────────────────────────────────
     # Config builder
@@ -314,6 +436,8 @@ class BotEngine:
     # Grace de 10 min evita corrida com extract_segment → pending_store.add().
     _GC_ORPHAN_INTERVAL_SEC = 600.0
     _GC_ORPHAN_MIN_AGE_SEC  = 600.0
+    # Resumo do funil no log (Patch 10). 5min: legível sem virar spam.
+    _HEALTH_LOG_INTERVAL_SEC = 300.0
 
     def _gc_orphan_pending_clips(self, clips_dir: Path) -> int:
         """
@@ -370,6 +494,7 @@ class BotEngine:
         import shutil
         last_state = "ok"  # ok | warn | halt
         last_gc_t  = time.time()
+        last_health_t = time.time()
         while not self._stop_event.is_set():
             try:
                 # ── GC periódico de órfãos ───────────────────────────────────
@@ -379,6 +504,14 @@ class BotEngine:
                         self._gc_orphan_pending_clips(clips_dir)
                     except Exception as e:
                         logger.debug(f"gc_orphan falhou: {e}")
+
+                # ── Resumo do funil por canal (Patch 10) ─────────────────────
+                if time.time() - last_health_t >= self._HEALTH_LOG_INTERVAL_SEC:
+                    last_health_t = time.time()
+                    try:
+                        self._log_health_summary()
+                    except Exception as e:
+                        logger.debug(f"health summary falhou: {e}")
 
                 free_gb = shutil.disk_usage(str(clips_dir)).free / 1e9
                 if free_gb < self._DISK_HALT_GB:
@@ -649,6 +782,7 @@ class BotEngine:
                 raw_file = capture.start_recording(platform)
             except Exception as e:
                 logger.error(f"❌ [{label}] Captura falhou (attempt #{attempt}): {e}")
+                self._touch_channel(label, state="reconnecting", attempt=attempt)
                 # Backoff antes de tentar de novo. Se stop_event veio durante
                 # o wait, sai do loop externo.
                 if self._stop_event.wait(timeout=backoff_s):
@@ -663,6 +797,7 @@ class BotEngine:
                 platform=platform, channel=channel,
             )
             detector.start(raw_file)
+            self._touch_channel(label, state="capturing", attempt=attempt)
 
             approval_mode  = config.get("system", {}).get("approval_mode", False)
             approval_top_n = int(config.get("system", {}).get("approval_top_n", 12))
@@ -687,6 +822,9 @@ class BotEngine:
                         break
 
                     moments = detector.all_moments
+                    # Heartbeat do loop do canal + gauge de momentos ativos.
+                    # tick_age_sec alto = thread travada (ex.: presa em upload).
+                    self._touch_channel(label, moments_active=len(moments))
 
                     # Poda periódica do dict processed (>1h)
                     now_ts = time.time()
@@ -712,6 +850,7 @@ class BotEngine:
                                 _metrics_incr("capture.recovered", platform=platform)
                                 _wd_state = "ok"
                                 _wd_last_warn_t = 0.0
+                                self._touch_channel(label, state="capturing")
                             # Gauge informativo (uma observação por canal)
                             try:
                                 from metrics import observe as _m_obs
@@ -737,6 +876,7 @@ class BotEngine:
                                                   platform=platform, channel=clean)
                                     _wd_state = "frozen"
                                     _wd_last_warn_t = now_ts
+                                    self._touch_channel(label, state="frozen")
 
                             # Trigger AUTO-RESTART do canal: frozen >120s.
                             # Damos 60s pro warn aparecer + 60s pra streamlink tentar
@@ -783,13 +923,18 @@ class BotEngine:
                                     seg_end   = seg_end + pad
 
                                 capture.extract_segment(raw_file, seg_start, seg_end, raw_clip)
+                                self._funnel(label, "detected", platform=platform, channel=clean)
+                                self._funnel(label, "extracted", platform=platform, channel=clean)
 
                                 self.pending_store.add(m, raw_clip, platform, clean)
+                                self._funnel(label, "pending_queued",
+                                             platform=platform, channel=clean)
                                 entry = self.pending_store.get(m.moment_id)
                                 if entry:
                                     self.on_moment_pending(entry)
                             except Exception as e:
                                 logger.error(f"❌ [{label}] Pending {m.reason}: {e}")
+                                self._funnel(label, "errors", platform=platform, channel=clean)
                         continue   # ← não cai no bloco de extração automática
 
                     # ── Modo automático: extrai e posta sem aprovação ─────────────
@@ -801,6 +946,7 @@ class BotEngine:
                             continue
 
                         processed[key] = now_ts
+                        self._funnel(label, "detected", platform=platform, channel=clean)
                         logger.info(
                             f"🎯 [{label}] [{m.reason}] "
                             f"{m.start_sec:.1f}s → {m.end_sec:.1f}s  score={m.score:.2f}"
@@ -821,6 +967,7 @@ class BotEngine:
                         )
                         if adv_score < 0.15:
                             logger.info(f"⏭️ [{label}] Score avançado muito baixo ({adv_score:.3f}), pulando")
+                            self._funnel(label, "score_gate", platform=platform, channel=clean)
                             continue
 
                         try:
@@ -854,6 +1001,8 @@ class BotEngine:
                                 )
                                 if effective_score < 0.10:
                                     logger.info(f"\u23ed\ufe0f [{label}] Score efetivo baixo ({effective_score:.2f}), pulando")
+                                    self._funnel(label, "reaction_gate",
+                                                 platform=platform, channel=clean)
                                     continue
 
                                 # (2) HookStartFinder
@@ -868,6 +1017,7 @@ class BotEngine:
                                     start = hook_start
 
                             capture.extract_segment(raw_file, start, end, raw_clip)
+                            self._funnel(label, "extracted", platform=platform, channel=clean)
 
                             # (3a) OfflineScreenGate \u2014 pega countdown/placeholder
                             # ANTES do QualityGate (mais barato + mais decisivo).
@@ -880,6 +1030,8 @@ class BotEngine:
                                     )
                                     _metrics_incr("engine.skipped_offline",
                                                   platform=platform, channel=clean)
+                                    self._funnel(label, "offline_gate",
+                                                 platform=platform, channel=clean)
                                     raw_clip.unlink(missing_ok=True)
                                     continue
                             except Exception as e:
@@ -897,6 +1049,8 @@ class BotEngine:
                                     if not passed:
                                         logger.warning(f"\U0001f6ab [{label}] QualityGate: {qg_reason} \u2014 SKIP")
                                         _metrics_incr("engine.quality_gate_failed", platform=platform)
+                                        self._funnel(label, "quality_gate",
+                                                     platform=platform, channel=clean)
                                         raw_clip.unlink(missing_ok=True)
                                         continue
 
@@ -926,8 +1080,11 @@ class BotEngine:
                             # process() retorna None se comercial detectado
                             if edited is None:
                                 logger.warning(f"⏭️ [{label}] Clip descartado (comercial ou filtro)")
+                                self._funnel(label, "editor_discard",
+                                             platform=platform, channel=clean)
                                 continue
 
+                            self._funnel(label, "rendered", platform=platform, channel=clean)
                             last_clip_time = time.time()
 
                             logger.info("✨ Gerando descrições com IA...")
@@ -988,6 +1145,8 @@ class BotEngine:
 
                             if ok:
                                 logger.info(f"✅ [{label}] Postado em: {', '.join(ok)}")
+                                self._funnel(label, "published",
+                                             platform=platform, channel=clean)
                             else:
                                 logger.info(f"💾 [{label}] Clip salvo: {edited}")
 
@@ -1003,6 +1162,7 @@ class BotEngine:
 
                         except Exception as e:
                             logger.error(f"❌ [{label}] Clip {m.reason}: {e}")
+                            self._funnel(label, "errors", platform=platform, channel=clean)
 
             except KeyboardInterrupt:
                 logger.info(f"⌨️  [{label}] Ctrl+C na thread do canal.")
@@ -1106,6 +1266,10 @@ class BotEngine:
             output_dir = Path(config["system"]["output_folder"])
             output_dir.mkdir(parents=True, exist_ok=True)
 
+            # Label do funil igual ao usado pelas threads de canal, para que
+            # approval-mode e auto-mode somem no MESMO canal.
+            _flabel = f"{entry['platform'].upper()}:{entry['channel']}"
+
             logger.info(f"🎬 Gerando clip do momento {moment_id[:8]} [{entry['reason']}]…")
 
             # OfflineScreenGate: pega countdown / "stream starting soon" / placeholder
@@ -1120,6 +1284,9 @@ class BotEngine:
                     _metrics_incr("engine.skipped_offline",
                                   channel=entry.get("channel", "?"),
                                   reason=entry.get("reason", "?"))
+                    self._funnel(_flabel, "offline_gate",
+                                 platform=entry.get("platform", ""),
+                                 channel=entry.get("channel", ""))
                     self.pending_store.finish_and_cleanup(moment_id)
                     return {
                         "ok": False,
@@ -1155,6 +1322,9 @@ class BotEngine:
                 logger.warning(
                     f"⏭️ Clip {moment_id[:8]} descartado pelo editor (comercial/filtro/SKIP)"
                 )
+                self._funnel(_flabel, "editor_discard",
+                             platform=entry.get("platform", ""),
+                             channel=entry.get("channel", ""))
                 try:
                     self.pending_store.finish_and_cleanup(moment_id)
                 except Exception as e:
@@ -1181,6 +1351,10 @@ class BotEngine:
                 "keywords":     entry.get("keywords", []),
                 "generated_at": datetime.now().isoformat(),
             }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            self._funnel(_flabel, "rendered",
+                         platform=entry.get("platform", ""),
+                         channel=entry.get("channel", ""))
 
             # Terminamos de usar o raw_clip: libera processing + remove entry +
             # apaga o .ts (se nenhum outro pendente o referenciar).
