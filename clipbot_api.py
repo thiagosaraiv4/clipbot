@@ -394,7 +394,29 @@ class ClipBotAPI:
         return {"ok": True, "started": True}
 
     def _do_generate_clip(self, moment_id: str, title_text: str = None) -> None:
-        result = self._engine.generate_clip_from_moment(moment_id, title_text=title_text)
+        """
+        Roda em thread daemon. INVARIANTE: onClipGenerated() é chamado
+        exatamente 1× em qualquer desfecho — senão a UI fica presa no spinner.
+
+        Blindado (P0-3): qualquer retorno inesperado ou exceção do engine vira
+        um payload de erro em vez de matar a thread silenciosamente.
+        """
+        try:
+            result = self._engine.generate_clip_from_moment(
+                moment_id, title_text=title_text
+            )
+            if not isinstance(result, dict):
+                logger.error(
+                    f"generate_clip_from_moment retornou {type(result).__name__} "
+                    "(esperado dict) — tratando como falha"
+                )
+                result = {"ok": False, "error": "Retorno inválido do engine"}
+        except Exception as e:
+            logger.error(f"generate_clip falhou: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            result = {"ok": False, "error": str(e)}
+
         payload = {**result, "moment_id": moment_id}
         self._js(f"onClipGenerated({json.dumps(payload)})")
 

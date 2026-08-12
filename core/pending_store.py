@@ -106,33 +106,74 @@ class PendingStore:
 
     def remove_and_cleanup(self, moment_id: str) -> None:
         """
-        Remove o momento. Se o raw_file não for referenciado por
-        nenhum outro momento pendente, apaga o arquivo do disco.
+        Remoção EXTERNA (reject da UI, descarte, limpeza).
+
+        A entry sai SEMPRE da store. O arquivo .ts só é apagado se ninguém
+        mais precisar dele:
+          • nenhum outro momento pendente aponta para o mesmo raw_file, E
+          • nenhum momento em processamento (inclusive este) o está lendo.
+
+        Se o arquivo estiver em uso, ele é preservado e recolhido depois pelo
+        GC de órfãos do disk monitor — nunca fica órfão permanente.
+
+        Antes (bug P0-1): o guard `if moment_id in self._processing: return`
+        abortava a função inteira, então generate_clip_from_moment() — que
+        marca processing ANTES e limpa DEPOIS — nunca conseguia remover nada.
+        """
+        self._remove(moment_id, released=False)
+
+    def finish_and_cleanup(self, moment_id: str) -> None:
+        """
+        Remoção pelo DONO do processamento: "terminei de usar este momento".
+
+        Libera a marca de processing e remove entry + arquivo (se não for
+        compartilhado com outro pendente). É o que generate_clip_from_moment()
+        deve chamar em todos os seus desfechos (sucesso, descarte, offline).
         """
         with self._lock:
-            # Não remove se está sendo processado por generate_clip
-            if moment_id in self._processing:
-                logger.debug(f"remove_and_cleanup: {moment_id[:8]} em processamento, ignorando.")
-                return
+            self._processing.discard(moment_id)
+        self._remove(moment_id, released=True)
+
+    # ── Implementação compartilhada ──────────────────────────────────────────
+
+    def _remove(self, moment_id: str, *, released: bool) -> None:
+        """
+        released=True  → chamador detinha o processing e já terminou.
+        released=False → remoção externa; respeita quem estiver processando.
+        Nunca lança. Idempotente.
+        """
+        with self._lock:
             entry = self._data.pop(moment_id, None)
             if not entry:
                 return
             raw_file = Path(entry.get("raw_file", ""))
-            # Verifica se algum outro momento usa o mesmo raw_file
+
+            # Outro momento pendente referencia o mesmo .ts?
             still_used = any(
                 Path(e.get("raw_file", "")) == raw_file
                 for e in self._data.values()
             )
-            # Também verifica se algum outro momento em processamento usa o arquivo
-            processing_uses = any(
-                Path(self._data[mid].get("raw_file", "")) == raw_file
-                for mid in self._processing
-                if mid in self._data
+            # Alguém está processando este .ts agora?
+            #   • o próprio momento (só conta se a remoção NÃO veio do dono)
+            #   • qualquer outro momento em processamento com o mesmo arquivo
+            in_use_by_processing = (
+                (not released and moment_id in self._processing)
+                or any(
+                    Path(self._data[mid].get("raw_file", "")) == raw_file
+                    for mid in self._processing
+                    if mid in self._data
+                )
             )
             self._save_locked()
 
-        # Apaga fora do lock para não bloquear outros threads
-        if not still_used and not processing_uses and raw_file.exists():
+        # Apaga fora do lock para não bloquear outras threads
+        if still_used or in_use_by_processing:
+            logger.debug(
+                f"raw clip preservado ({raw_file.name}): "
+                f"still_used={still_used} in_use={in_use_by_processing}"
+            )
+            return
+        if raw_file.exists():
             try:
                 raw_file.unlink()
                 logger.info(f"🗑️  Raw clip removido: {raw_file.name}")

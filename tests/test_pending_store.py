@@ -47,17 +47,43 @@ def test_remove_after_set_processing_removes_entry(store, raw_ts):
     assert len(store) == 0
 
 
-def test_remove_after_set_processing_deletes_raw_file(store, raw_ts):
-    """P0-1 (FALHA HOJE): o .ts precisa sair do disco — senão o disco enche."""
+def test_finish_and_cleanup_deletes_entry_and_raw_file(store, raw_ts):
+    """
+    P0-1 — fluxo do DONO do processamento (generate_clip_from_moment):
+    ao terminar, entry e .ts precisam sair. Senão o disco enche.
+
+    Nota de especificação: este caso e
+    `test_reject_during_processing_must_not_delete_file_in_use` executam a
+    MESMA sequência (set_processing → remover), mas exigem resultados opostos
+    para o arquivo. A diferença é semântica — quem chama:
+      • dono terminou   → finish_and_cleanup() → pode apagar
+      • reject externo  → remove_and_cleanup() → preserva o arquivo em uso
+    """
     raw = raw_ts()
     m = make_moment()
     store.add(m, raw, "twitch", "baiano")
 
     store.set_processing(m.moment_id)
-    store.remove_and_cleanup(m.moment_id)
-    store.clear_processing(m.moment_id)
+    store.finish_and_cleanup(m.moment_id)
 
+    assert store.get(m.moment_id) is None
     assert not raw.exists(), "raw .ts ficou órfão no disco"
+    assert m.moment_id not in store._processing, "flag de processing não liberada"
+
+
+def test_finish_and_cleanup_keeps_raw_shared_with_other_pending(store, raw_ts):
+    """INVARIANTE I2 vale também no fluxo do dono."""
+    raw = raw_ts()
+    m1 = make_moment(start=100.0, end=115.0, reason="keyword")
+    m2 = make_moment(start=200.0, end=215.0, reason="chat_flood")
+    store.add(m1, raw, "twitch", "baiano")
+    store.add(m2, raw, "twitch", "baiano")
+
+    store.set_processing(m1.moment_id)
+    store.finish_and_cleanup(m1.moment_id)
+
+    assert store.get(m1.moment_id) is None
+    assert raw.exists(), "apagou .ts ainda referenciado por outro pendente"
 
 
 def test_raw_kept_when_shared_by_another_pending(store, raw_ts):
@@ -108,8 +134,7 @@ def test_persistence_roundtrip_does_not_resurrect_removed(store, raw_ts, tmp_pat
     m = make_moment()
     store.add(m, raw, "twitch", "baiano")
     store.set_processing(m.moment_id)
-    store.remove_and_cleanup(m.moment_id)
-    store.clear_processing(m.moment_id)
+    store.finish_and_cleanup(m.moment_id)
 
     reloaded = pending_store.PendingStore()
     assert reloaded.get(m.moment_id) is None, (

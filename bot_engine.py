@@ -310,16 +310,76 @@ class BotEngine:
     _DISK_HALT_GB = 1.0
     _DISK_CHECK_INTERVAL_SEC = 60.0
 
+    # GC de órfãos: pendentes extraídos que não estão mais na store.
+    # Grace de 10 min evita corrida com extract_segment → pending_store.add().
+    _GC_ORPHAN_INTERVAL_SEC = 600.0
+    _GC_ORPHAN_MIN_AGE_SEC  = 600.0
+
+    def _gc_orphan_pending_clips(self, clips_dir: Path) -> int:
+        """
+        Apaga raw_pending_*.ts que não são referenciados pela PendingStore.
+
+        Complementa o Patch 1: quando um .ts está em uso no instante da
+        remoção, ele é preservado — e recolhido aqui depois. Também limpa
+        pendentes deixados por crashes/restarts anteriores.
+
+        NÃO toca no .ts de captura ativo: o padrão raw_pending_* exclui os
+        arquivos de gravação contínua (raw_{platform}_{canal}_{ts}.ts).
+        """
+        try:
+            referenced = {
+                os.path.normpath(e.get("raw_file", ""))
+                for e in self.pending_store.list_all()
+                if e.get("raw_file")
+            }
+        except Exception as e:
+            logger.debug(f"gc_orphan: store indisponível ({e})")
+            return 0
+
+        now = time.time()
+        removed = 0
+        freed_mb = 0.0
+        for f in clips_dir.glob("raw_pending_*.ts"):
+            try:
+                if os.path.normpath(str(f)) in referenced:
+                    continue
+                if (now - f.stat().st_mtime) < self._GC_ORPHAN_MIN_AGE_SEC:
+                    continue          # recém-extraído: pode ainda não estar na store
+                size_mb = f.stat().st_size / 1e6
+                f.unlink(missing_ok=True)
+                removed += 1
+                freed_mb += size_mb
+            except Exception:
+                pass
+
+        if removed:
+            logger.info(
+                f"🧹 GC órfãos: {removed} raw pendente(s) removido(s) "
+                f"({freed_mb:.0f} MB liberados)"
+            )
+            _metrics_incr("disk.orphan_gc_removed", n=removed)
+        return removed
+
     def _disk_monitor_loop(self, clips_dir: Path) -> None:
         """
         Roda em thread daemon paralela. A cada 60s checa o disco do clips_dir.
         Em <5GB livre: warn (1× por estado).
         Em <1GB livre: warn final + set _stop_event para parar engine.
+        A cada 10min: GC de raw pendentes órfãos (Patch 1b).
         """
         import shutil
         last_state = "ok"  # ok | warn | halt
+        last_gc_t  = time.time()
         while not self._stop_event.is_set():
             try:
+                # ── GC periódico de órfãos ───────────────────────────────────
+                if time.time() - last_gc_t >= self._GC_ORPHAN_INTERVAL_SEC:
+                    last_gc_t = time.time()
+                    try:
+                        self._gc_orphan_pending_clips(clips_dir)
+                    except Exception as e:
+                        logger.debug(f"gc_orphan falhou: {e}")
+
                 free_gb = shutil.disk_usage(str(clips_dir)).free / 1e9
                 if free_gb < self._DISK_HALT_GB:
                     if last_state != "halt":
@@ -1055,8 +1115,12 @@ class BotEngine:
                     _metrics_incr("engine.skipped_offline",
                                   channel=entry.get("channel", "?"),
                                   reason=entry.get("reason", "?"))
-                    self.pending_store.remove_and_cleanup(moment_id)
-                    return {"ok": False, "error": f"Offline screen detectada: {off_info}"}
+                    self.pending_store.finish_and_cleanup(moment_id)
+                    return {
+                        "ok": False,
+                        "reason": "offline_screen",
+                        "error": f"Offline screen detectada: {off_info}",
+                    }
             except Exception as e:
                 logger.debug(f"offline_screen check falhou: {e}")
 
@@ -1076,17 +1140,25 @@ class BotEngine:
             edited = editor.process(raw_clip, name, title_text=title_text)
 
             # editor.process() retorna None se clip foi descartado (comercial,
-            # content_filter blacklist, ou outro motivo). Não cria sidecar nem
-            # progredir — só limpa o pending e sai.
+            # content_filter blacklist, ou outro motivo). Não cria sidecar —
+            # só limpa o pending e sai.
+            #
+            # CONTRATO (P0-3): esta função retorna SEMPRE dict com chave "ok".
+            # Retornar None quebrava clipbot_api._do_generate_clip ({**result}
+            # → TypeError → thread morta → UI presa em "gerando...").
             if edited is None:
                 logger.warning(
-                    f"⏭️ Clip {moment_id} descartado pelo editor (comercial/filtro/SKIP)"
+                    f"⏭️ Clip {moment_id[:8]} descartado pelo editor (comercial/filtro/SKIP)"
                 )
                 try:
-                    self.pending_store.remove_and_cleanup(moment_id)
+                    self.pending_store.finish_and_cleanup(moment_id)
                 except Exception as e:
                     logger.debug(f"cleanup falhou: {e}")
-                return None
+                return {
+                    "ok": False,
+                    "reason": "editor_discard",
+                    "error": "Clip descartado pelo editor (comercial, blacklist ou filtro)",
+                }
 
             # ── Sidecar JSON ──────────────────────────────────────────────────
             sidecar = edited.with_suffix(".json")
@@ -1105,8 +1177,9 @@ class BotEngine:
                 "generated_at": datetime.now().isoformat(),
             }, indent=2, ensure_ascii=False), encoding="utf-8")
 
-            # Remove da store (apaga raw_clip se não referenciado por outros)
-            self.pending_store.remove_and_cleanup(moment_id)
+            # Terminamos de usar o raw_clip: libera processing + remove entry +
+            # apaga o .ts (se nenhum outro pendente o referenciar).
+            self.pending_store.finish_and_cleanup(moment_id)
 
             with self._stats_lock:
                 self.clips_today += 1
