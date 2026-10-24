@@ -131,7 +131,12 @@ def _ensure_blazeface():
         from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision as mp_vision
 
-        base = mp_python.BaseOptions(model_asset_path=str(model_path))
+        # model_asset_buffer (NÃO model_asset_path): o loader nativo do MediaPipe
+        # não abre caminhos não-ASCII no Windows — com o projeto em
+        # "...\Área de Trabalho\..." o path falha com FileNotFoundError mesmo
+        # existindo, derrubando o tracker para o fallback Haar (hit ~1%).
+        # Lendo os bytes em Python o caminho nunca chega ao C++.
+        base = mp_python.BaseOptions(model_asset_buffer=model_path.read_bytes())
         options = mp_vision.FaceDetectorOptions(
             base_options=base,
             running_mode=mp_vision.RunningMode.IMAGE,
