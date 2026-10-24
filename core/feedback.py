@@ -28,6 +28,8 @@ Regra de atualização:
 
 import json
 import logging
+
+import safe_io
 import os
 import threading
 import time
@@ -82,15 +84,19 @@ def load_weights() -> Dict[str, float]:
 
 
 def save_weights(weights: Dict[str, float]) -> None:
-    """Salva pesos no disco."""
+    """
+    Salva pesos no disco (atômico, com retry).
+
+    Perder os pesos degrada o ranking, não derruba o bot — por isso a falha é
+    engolida. Mas vira WARNING com o caminho, para não repetir o 12/08, em que
+    um arquivo de estado simplesmente não apareceu e nada no log explicava.
+    """
     try:
-        APP_DATA.mkdir(parents=True, exist_ok=True)
-        WEIGHTS_FILE.write_text(
-            json.dumps(weights, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        safe_io.atomic_write_text(
+            WEIGHTS_FILE, json.dumps(weights, indent=2, ensure_ascii=False)
         )
-    except Exception as ex:
-        logger.warning(f"feedback_weights.json save falhou: {ex}")
+    except OSError as ex:
+        logger.warning(f"⚠️  {WEIGHTS_FILE.name} não foi gravado: {ex}")
 
 
 # ─── Scoring ──────────────────────────────────────────────────────────────────
@@ -240,17 +246,15 @@ def _save_channel_history(history: dict) -> None:
     """Salva histórico no disco e invalida cache (próxima leitura recarrega)."""
     global _channel_cache, _channel_cache_ts
     try:
-        APP_DATA.mkdir(parents=True, exist_ok=True)
-        CHANNEL_HISTORY.write_text(
-            json.dumps(history, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        safe_io.atomic_write_text(
+            CHANNEL_HISTORY, json.dumps(history, indent=2, ensure_ascii=False)
         )
         # Atualiza cache em vez de invalidar — evita roundtrip desnecessário
         with _channel_cache_lock:
             _channel_cache = dict(history)
             _channel_cache_ts = time.monotonic()
-    except Exception as ex:
-        logger.debug(f"channel_history save falhou: {ex}")
+    except OSError as ex:
+        logger.warning(f"⚠️  {CHANNEL_HISTORY.name} não foi gravado: {ex}")
 
 
 def update_channel_history(channel: str, reason: str, score: float) -> None:

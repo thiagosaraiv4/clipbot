@@ -19,6 +19,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import safe_io
+
 logger = logging.getLogger("ClipBot.PendingStore")
 
 APP_DATA    = Path(os.environ.get("APPDATA", Path.home())) / "ClipBot"
@@ -39,6 +41,10 @@ class PendingStore:
         self._lock: threading.Lock = threading.Lock()
         self._data: Dict[str, dict] = {}
         self._processing: set = set()   # moment_ids currently being processed
+        #: Última falha de persistência (None = disco saudável). Exposto no
+        #: heartbeat para que "momento sumiu" deixe de ser invisível.
+        self.last_save_error: Optional[str] = None
+        self._save_fail_count: int = 0
         self._load()
 
     # ── Leitura ───────────────────────────────────────────────────────────────
@@ -184,55 +190,90 @@ class PendingStore:
 
     def _save_locked(self) -> None:
         """
-        Salva no disco atomicamente. DEVE ser chamado DENTRO do lock.
+        Salva no disco atomicamente (safe_io: tmp + fsync + rename + retry).
+        DEVE ser chamado DENTRO do lock.
 
-        Atomicidade: escreve em arquivo .tmp e faz os.replace (rename atômico no
-        Windows desde Python 3.3+). Crash no meio do write não corrompe o
-        pending.json original — perde-se apenas a última mutação.
+        A falha NÃO propaga: o momento já está em memória e a UI de aprovação
+        tem de continuar funcionando com o disco quebrado. Mas ela deixa de ser
+        silenciosa — em 12/08, três pendentes (128 MB de .ts) não apareceram no
+        pending.json e os logs não permitiam distinguir "a escrita falhou" de
+        "a escrita nunca foi tentada". Agora a falha vira ERROR + last_save_error,
+        que o engine expõe no heartbeat do canal.
         """
         try:
-            APP_DATA.mkdir(parents=True, exist_ok=True)
-            tmp_path = PENDING_FILE.with_suffix(".json.tmp")
-            payload = json.dumps(
-                list(self._data.values()), indent=2, ensure_ascii=False
+            safe_io.atomic_write_text(
+                PENDING_FILE,
+                json.dumps(list(self._data.values()), indent=2, ensure_ascii=False),
             )
-            # Escreve em .tmp + flush/fsync antes de renomear
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(payload)
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    # Alguns FS (network drives, FAT32) não suportam fsync
-                    pass
-            # Rename atômico (substitui pending.json antigo)
-            os.replace(tmp_path, PENDING_FILE)
-        except Exception as ex:
-            logger.warning(f"pending.json save falhou: {ex}")
-            # Cleanup do .tmp em caso de falha
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        except OSError as ex:
+            self.last_save_error = str(ex)
+            self._save_fail_count += 1
+            logger.error(
+                f"❌ pending.json NÃO foi gravado ({ex}). "
+                f"{len(self._data)} momento(s) existem só em memória e serão "
+                f"perdidos ao fechar o app (falha nº {self._save_fail_count}). "
+                "Verifique permissões/antivírus em "
+                f"{PENDING_FILE.parent}"
+            )
+            return
+
+        if self.last_save_error is not None:
+            logger.info("✅ pending.json voltou a ser gravado.")
+        self.last_save_error = None
 
     def _load(self) -> None:
         """Carrega do disco na inicialização. Descarta entradas sem raw_file."""
-        if not PENDING_FILE.exists():
+        status, raw, err = safe_io.read_text_classified(PENDING_FILE)
+
+        if status == safe_io.MISSING:
             return
+
+        if status != safe_io.OK:
+            # Existe e não abriu: NÃO é "primeira execução". Pendentes reais
+            # podem estar nesse arquivo, e sobrescrevê-lo os apagaria.
+            self.last_save_error = err
+            logger.error(
+                f"❌ {PENDING_FILE.name} existe mas não pôde ser lido ({err}). "
+                "Momentos pendentes da sessão anterior não foram restaurados."
+            )
+            return
+
         try:
-            entries = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
-            recovered = 0
-            for e in entries:
-                mid = e.get("moment_id")
-                if not mid:
-                    continue
-                raw = Path(e.get("raw_file", ""))
-                if not raw.exists():
-                    logger.debug(f"pending: raw_file ausente, descartando {mid[:8]}")
-                    continue
-                self._data[mid] = e
-                recovered += 1
-            if recovered:
-                logger.info(f"📋 Restaurados {recovered} momento(s) pendente(s) do disco.")
+            entries = json.loads(raw)
+            if not isinstance(entries, list):
+                raise ValueError(f"esperado lista, veio {type(entries).__name__}")
         except Exception as ex:
-            logger.warning(f"pending.json load falhou: {ex}")
+            self._quarantine_corrupt(ex)
+            return
+
+        recovered = 0
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            mid = e.get("moment_id")
+            if not mid:
+                continue
+            raw_path = Path(e.get("raw_file", ""))
+            if not raw_path.exists():
+                logger.debug(f"pending: raw_file ausente, descartando {mid[:8]}")
+                continue
+            self._data[mid] = e
+            recovered += 1
+        if recovered:
+            logger.info(f"📋 Restaurados {recovered} momento(s) pendente(s) do disco.")
+
+    def _quarantine_corrupt(self, ex: Exception) -> None:
+        """
+        Move um pending.json ilegível para .corrupt.<timestamp> em vez de
+        deixá-lo ser sobrescrito pelo próximo save. O arquivo é a única pista
+        de quais .ts no disco tinham dono — descartá-lo em silêncio transforma
+        um bug diagnosticável em GB de órfãos sem explicação.
+        """
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = PENDING_FILE.with_name(f"{PENDING_FILE.name}.corrupt.{stamp}")
+        try:
+            os.replace(PENDING_FILE, backup)
+            where = f"cópia preservada em {backup.name}"
+        except OSError as mv_ex:
+            where = f"cópia NÃO pôde ser preservada ({mv_ex})"
+        logger.error(f"❌ {PENDING_FILE.name} corrompido ({ex}). {where}")

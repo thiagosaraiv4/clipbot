@@ -185,6 +185,22 @@ class ClipBotAPI:
         try:
             allowed = {"anthropic_api_key", "openai_api_key", "google_api_key"}
             creds = load_credentials() or {}
+            # `creds` vazio pode significar "nada salvo ainda" OU "falhei ao
+            # ler". No segundo caso, gravar apagaria as outras credenciais
+            # (tiktok/instagram/youtube) que continuam no disco. save_credentials
+            # recusaria, mas aqui o erro fica legível para a UI.
+            import credentials as _c
+            if _c.storage_degraded("credentials"):
+                return {
+                    "ok": False,
+                    "reason": "storage_degraded",
+                    "error": (
+                        "Não foi possível ler credentials.enc "
+                        f"({_c.degraded_reason('credentials')}). Salvar agora "
+                        "apagaria suas outras credenciais. Verifique o "
+                        "antivírus/permissões da pasta e reinicie o ClipBot."
+                    ),
+                }
             updated = []
             for k, v in (keys or {}).items():
                 if k not in allowed:
@@ -216,6 +232,7 @@ class ClipBotAPI:
             "clips_today": self._engine.clips_today if self._engine else 0,
             "clips_total": self._engine.clips_total if self._engine else 0,
             "channels":    {},
+            "storage":     {"ok": True},
         }
         # Funil + heartbeat por canal (Patch 10). Nunca deixa get_status falhar:
         # a UI depende dele para saber se o engine está vivo.
@@ -224,7 +241,32 @@ class ClipBotAPI:
                 status["channels"] = self._engine.get_health()
             except Exception as e:
                 logger.debug(f"get_health: {e}")
+        # Saúde do disco de estado. Sem isto, "o momento sumiu" e "a key não
+        # foi salva" chegam ao usuário como mistério (incidente de 12/08).
+        try:
+            status["storage"] = self._storage_health()
+        except Exception as e:
+            logger.debug(f"storage_health: {e}")
         return status
+
+    def _storage_health(self) -> dict:
+        """Estado consolidado do armazenamento, para a UI avisar o usuário."""
+        import credentials as _c
+        problems = []
+        for kind in ("credentials", "settings"):
+            reason = _c.degraded_reason(kind)
+            if reason:
+                problems.append({"what": kind, "error": reason, "writes_blocked": True})
+
+        save_err = None
+        if self._engine is not None:
+            save_err = getattr(self._engine.pending_store, "last_save_error", None)
+        if save_err:
+            problems.append(
+                {"what": "pending", "error": save_err, "writes_blocked": False}
+            )
+
+        return {"ok": not problems, "problems": problems}
 
     def start_engine(self) -> dict:
         if self._engine and self._engine.is_running:

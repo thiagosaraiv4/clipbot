@@ -226,6 +226,26 @@ class BotEngine:
         Resumo periódico no log — a resposta rápida para
         "está rodando, mas por que não saiu clip?".
         """
+        # Disco de estado: se a persistência está quebrada, isto precisa
+        # aparecer ANTES do funil — momentos "ativos" que não estão no
+        # pending.json desaparecem quando o app fecha.
+        save_err = getattr(self.pending_store, "last_save_error", None)
+        if save_err:
+            logger.error(
+                f"❌ [storage] pending.json não está sendo gravado ({save_err}). "
+                "Momentos aprovados existem só em memória."
+            )
+        try:
+            import credentials as _c
+            for _kind in ("credentials", "settings"):
+                _why = _c.degraded_reason(_kind)
+                if _why:
+                    logger.error(
+                        f"❌ [storage] {_kind} ilegível ({_why}) — escrita bloqueada."
+                    )
+        except Exception:
+            pass
+
         health = self.get_health()
         if not health:
             return

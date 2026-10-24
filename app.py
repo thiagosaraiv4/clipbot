@@ -64,6 +64,24 @@ def main():
 
     api = ClipBotAPI()
 
+    # ── Disco de estado: descobrir AGORA que o APPDATA está bloqueado ──────
+    # Em 12/08 o app rodou 6 min achando que estava persistindo momentos e
+    # credenciais. Uma sonda de escrita no boot custa milissegundos e troca
+    # "sumiu misteriosamente" por uma linha explícita no log.
+    try:
+        import safe_io
+        from credentials import APP_DATA as _APP_DATA
+        _ok, _err = safe_io.check_writable(_APP_DATA)
+        if not _ok:
+            logging.getLogger("ClipBot").error(
+                f"❌ Pasta de estado NÃO é gravável: {_APP_DATA} ({_err}). "
+                "Momentos pendentes, credenciais e configurações não serão "
+                "salvos. Verifique antivírus/permissões antes de continuar."
+            )
+    except Exception as _e:
+        logging.getLogger("ClipBot").warning(f"checagem de gravabilidade: {_e}")
+
+
     # ── Telemetria: reporter + sampler em background (custo <0.1% CPU) ──────
     if _HAS_METRICS:
         try:

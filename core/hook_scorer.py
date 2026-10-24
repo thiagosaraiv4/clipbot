@@ -88,12 +88,17 @@ def _load_key(env_name: str, cred_keys: List[str], settings_keys: List[str]) -> 
 
     # 2. credentials.enc
     try:
-        from credentials import load_credentials, CRED_FILE
-        cred_exists = CRED_FILE.exists()
+        from credentials import load_credentials, degraded_reason, CRED_FILE
         creds = load_credentials() or {}
+        # NÃO use CRED_FILE.exists() aqui: no Windows ele devolve False quando a
+        # abertura falha por permissão, e foi assim que o diagnóstico de 12/08
+        # reportou "file_exists=False" para um arquivo que existia e funcionava.
+        # load_credentials já classifica o estado real.
+        degraded = degraded_reason("credentials")
         logger.debug(
-            f"  credentials.enc: file_exists={cred_exists} "
-            f"path={CRED_FILE} loaded_keys={sorted(creds.keys()) if creds else '[]'}"
+            f"  credentials.enc: path={CRED_FILE} "
+            f"state={'DEGRADADO: ' + degraded if degraded else 'ok'} "
+            f"loaded_keys={sorted(creds.keys()) if creds else '[]'}"
         )
         for ck in cred_keys:
             v = (creds.get(ck) or "").strip()
