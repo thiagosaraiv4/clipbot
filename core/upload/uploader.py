@@ -11,6 +11,7 @@ Mudanças v2.4 (teardown Playwright):
 """
 
 import logging
+import os
 import time
 import atexit
 import threading
@@ -388,6 +389,21 @@ class InstagramUploader:
 # YouTube Shorts
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Prazo para o usuário concluir a autorização no navegador. Sem ele,
+# run_local_server esperava para sempre — no modo automático, com a thread do
+# canal parada.
+_YT_AUTH_TIMEOUT_SEC = 300
+
+
+class YouTubeAuthError(RuntimeError):
+    """O login do YouTube precisa ser refeito (ou não pôde ser concluído)."""
+
+
+def _clipbot_appdata() -> Path:
+    """APPDATA/ClipBot, como o resto do app (antes: Path.home()/AppData/...)."""
+    return Path(os.environ.get("APPDATA", Path.home())) / "ClipBot"
+
+
 class YouTubeUploader:
 
     def __init__(self, config: dict):
@@ -399,7 +415,16 @@ class YouTubeUploader:
             return self._service
 
         from googleapiclient.discovery import build
-        from google_auth_oauthlib.flow import InstalledAppFlow
+        try:
+            from google_auth_oauthlib.flow import InstalledAppFlow
+        except ImportError as e:
+            # Antes: caía no "google-api-python-client não instalado" do
+            # upload(), que é outro pacote.
+            raise YouTubeAuthError(
+                "pacote google-auth-oauthlib não instalado — rode: "
+                "pip install google-auth-oauthlib"
+            ) from e
+        from google.auth.exceptions import RefreshError
         from google.auth.transport.requests import Request
         import pickle
 
@@ -407,7 +432,7 @@ class YouTubeUploader:
         cred_file = self.cfg.get("credentials_file", "")
 
         if not cred_file or not Path(cred_file).exists():
-            fallback = Path.home() / "AppData" / "Roaming" / "ClipBot" / "youtube_credentials.json"
+            fallback = _clipbot_appdata() / "youtube_credentials.json"
             if fallback.exists():
                 cred_file = str(fallback)
             else:
@@ -416,20 +441,50 @@ class YouTubeUploader:
                     "Vá em Accounts → YouTube e selecione o arquivo do Google Cloud."
                 )
 
-        token_path = Path.home() / "AppData" / "Roaming" / "ClipBot" / "youtube_token.pickle"
+        token_path = _clipbot_appdata() / "youtube_token.pickle"
         token_path.parent.mkdir(parents=True, exist_ok=True)
         creds = None
 
         if token_path.exists():
-            with open(token_path, "rb") as f:
-                creds = pickle.load(f)
+            try:
+                with open(token_path, "rb") as f:
+                    creds = pickle.load(f)
+            except Exception as e:
+                # Corrompido: descarta e reautoriza, em vez de quebrar todo upload.
+                logger.warning(f"⚠️  Token do YouTube ilegível ({e}); será refeita a autorização")
+                token_path.unlink(missing_ok=True)
+                creds = None
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
+                try:
+                    creds.refresh(Request())
+                except RefreshError as e:
+                    # Revogado/expirado (invalid_grant). Com o token no disco,
+                    # TODO upload seguinte refazia o mesmo refresh e falhava.
+                    token_path.unlink(missing_ok=True)
+                    raise YouTubeAuthError(
+                        "o login do YouTube expirou ou foi revogado — reautorize no "
+                        "próximo upload. Se o app OAuth está em modo de teste no "
+                        "Google Cloud, os tokens duram 7 dias: publique o app "
+                        "(Em produção) para evitar isso."
+                    ) from e
             else:
-                flow  = InstalledAppFlow.from_client_secrets_file(cred_file, SCOPES)
-                creds = flow.run_local_server(port=0)
+                flow = InstalledAppFlow.from_client_secrets_file(cred_file, SCOPES)
+                try:
+                    creds = flow.run_local_server(
+                        port=0, timeout_seconds=_YT_AUTH_TIMEOUT_SEC,
+                    )
+                except Exception as e:
+                    raise YouTubeAuthError(
+                        "autorização do YouTube não concluída em "
+                        f"{_YT_AUTH_TIMEOUT_SEC // 60} min ({e}); tente de novo e "
+                        "reautorize no navegador"
+                    ) from e
+                if not creds:
+                    raise YouTubeAuthError(
+                        "autorização do YouTube não concluída; reautorize no navegador"
+                    )
             with open(token_path, "wb") as f:
                 pickle.dump(creds, f)
 
@@ -476,6 +531,9 @@ class YouTubeUploader:
             logger.info(f"✅ YouTube: https://youtube.com/shorts/{response.get('id')}")
             return True
 
+        except YouTubeAuthError as e:
+            logger.error(f"🔑 YouTube: {e}")
+            return False
         except ImportError:
             logger.error("google-api-python-client não instalado.")
             return False
