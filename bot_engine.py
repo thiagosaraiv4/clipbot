@@ -58,11 +58,13 @@ class QueueHandler(logging.Handler):
 class BotEngine:
 
     def __init__(self, on_status=None, on_log=None, on_clip_posted=None,
-                 on_moment_pending=None, pending_store=None):
+                 on_moment_pending=None, pending_store=None, publish_queue=None):
         self.on_status         = on_status         or (lambda s: None)
         self.on_log            = on_log            or (lambda lvl, msg: None)
         self.on_clip_posted    = on_clip_posted    or (lambda info: None)
         self.on_moment_pending = on_moment_pending or (lambda entry: None)
+        # Fila de publicação (Patch 6): o modo automático só enfileira.
+        self.publish_queue     = publish_queue
 
         self._thread:     threading.Thread = None
         self._stop_event  = threading.Event()
@@ -1204,91 +1206,43 @@ class BotEngine:
                             self._funnel(label, "rendered", platform=platform, channel=clean)
                             last_clip_time = time.time()
 
-                            logger.info("✨ Gerando descrições com IA...")
-                            all_results = {}
-
-                            active_upload = {
-                                "tiktok":    config["upload"]["tiktok"]["enabled"],
-                                "instagram": config["upload"]["instagram"]["enabled"],
-                                "youtube":   config["upload"]["youtube"]["enabled"],
-                            }
-
-                            from uploader import DailyPublishLimit, publish_with_limit
-                            limits = DailyPublishLimit(config["upload"].get("max_clips_per_day"))
-                            for upload_plat, enabled in active_upload.items():
-                                if not enabled:
-                                    continue
-                                # Teto diário ANTES da descrição: não gasta LLM
-                                # com post que não vai sair (B2).
-                                if not limits.has_room(upload_plat):
-                                    logger.warning(
-                                        f"⏸ [{label}] {upload_plat}: limite diário atingido, post pulado"
-                                    )
-                                    all_results[upload_plat] = False
-                                    continue
-                                try:
-                                    desc    = desc_gen.generate(
-                                        video_path=edited, platform=upload_plat,
-                                        channel=clean, reason=m.reason,
-                                    )
-                                    title   = desc["title"]
-                                    caption = desc["caption"]
-                                    tags    = desc["hashtags"]
-                                    logger.info(f"📝 [{upload_plat}] {title}")
-
-                                    post = None
-                                    if upload_plat == "tiktok" and uploader.tiktok:
-                                        post = lambda: uploader.tiktok.upload(edited, caption, tags)
-                                    elif upload_plat == "instagram" and uploader.instagram:
-                                        post = lambda: uploader.instagram.upload(edited, caption)
-                                    elif upload_plat == "youtube" and uploader.youtube:
-                                        post = lambda: uploader.youtube.upload(edited, title, caption)
-                                    if post is not None:
-                                        res = publish_with_limit(limits, upload_plat, post)
-                                        all_results[upload_plat] = bool(res)
-                                        if res is None:
-                                            continue
-
-                                    _metrics_incr(
-                                        "engine.upload_attempt",
-                                        platform=upload_plat,
-                                        ok=str(bool(all_results.get(upload_plat))),
-                                    )
-
-                                    delay = config["upload"]["delay_between_posts"]
-                                    if all_results.get(upload_plat) and delay > 0:
-                                        logger.info(f"⏳ Delay {delay}s entre uploads...")
-                                        self._stop_event.wait(timeout=delay)
-
-                                except Exception as e:
-                                    logger.error(f"❌ Upload {upload_plat}: {e}")
-                                    all_results[upload_plat] = False
-                                    _metrics_incr("engine.upload_exception",
-                                                  platform=upload_plat)
-
-                            ok = [p for p, v in all_results.items() if v]
+                            # ── Publicação: o canal só ENFILEIRA (Patch 6) ────────────
+                            # Antes: descrições (Whisper + LLM), upload em cada
+                            # plataforma e delay_between_posts DENTRO do loop de
+                            # captura — ~15 min parado por clip com 3 plataformas,
+                            # e os momentos detectados nesse meio-tempo expiravam.
+                            # A fila publica numa thread própria, com intervalo,
+                            # retry, teto diário e limpeza só com tudo confirmado.
+                            targets = [p for p in ("tiktok", "instagram", "youtube")
+                                       if (config["upload"].get(p) or {}).get("enabled")]
+                            queued = None
+                            if targets and self.publish_queue is not None:
+                                queued = self.publish_queue.enqueue(
+                                    edited, targets, channel=clean, reason=m.reason,
+                                    label=label, title=auto_title,
+                                )
+                            elif targets:
+                                logger.warning(
+                                    f"⚠️  [{label}] sem fila de publicação — clip salvo sem postar"
+                                )
 
                             # ── Contadores com lock ───────────────────────────────
                             with self._stats_lock:
                                 self.clips_today += 1
                                 self.clips_total += 1
 
-                            if ok:
-                                logger.info(f"✅ [{label}] Postado em: {', '.join(ok)}")
-                                self._funnel(label, "published",
-                                             platform=platform, channel=clean)
+                            if queued:
+                                logger.info(f"📬 [{label}] Clip na fila de publicação: {', '.join(targets)}")
                             else:
                                 logger.info(f"💾 [{label}] Clip salvo: {edited}")
 
                             self.on_clip_posted({
                                 "name":      name,
                                 "reason":    m.reason,
-                                "platforms": ok,
+                                "platforms": [],
+                                "queued":    targets if queued else [],
                                 "time":      datetime.now().strftime("%H:%M"),
                             })
-
-                            if config["system"]["cleanup_after_upload"] and ok:
-                                edited.unlink(missing_ok=True)
 
                         except Exception as e:
                             logger.error(f"❌ [{label}] Clip {m.reason}: {e}")

@@ -138,17 +138,19 @@ def test_publish_with_limit_gives_back_the_slot_on_exception(limits_mod):
 
 # ── Integração: upload manual da UI ─────────────────────────────────────────
 
-def test_manual_upload_respects_the_ui_limit(tmp_path, monkeypatch):
-    """O caminho de produção que o teste da revisão apontou."""
+def _manual_upload_rig(tmp_path, monkeypatch, max_per_day):
+    """API real com settings em tmp, uploader do TikTok e descrição falsos."""
     monkeypatch.setenv("APPDATA", str(tmp_path))
     import clipbot_api
     import credentials as c
+    import description_generator
     import uploader
     monkeypatch.setattr(c, "CONFIG_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(c, "CRED_FILE", tmp_path / "credentials.enc")
     c.reset_storage_health()
     settings = c._default_settings()
-    settings["upload"]["max_per_day"] = 2
+    settings["upload"]["max_per_day"] = max_per_day
+    settings["upload"]["delay_sec"] = 0
     c.save_settings(settings)
 
     posted = []
@@ -162,13 +164,28 @@ def test_manual_upload_respects_the_ui_limit(tmp_path, monkeypatch):
             return True
 
     monkeypatch.setattr(uploader, "TikTokUploader", FakeTikTok)
+    monkeypatch.setattr(description_generator.DescriptionGenerator, "generate",
+                        lambda self, **kw: {"title": "t", "caption": "c", "hashtags": []})
     api = clipbot_api.ClipBotAPI()
+    monkeypatch.setattr(api._publish_queue, "start", lambda: None)   # drena à mão
+    return api, posted
+
+
+def test_manual_upload_respects_the_ui_limit(tmp_path, monkeypatch):
+    """
+    O caminho de produção que a revisão apontou. Desde o Patch 6, o upload
+    manual passa pela fila: o 3º post não some — fica adiado para amanhã.
+    """
+    api, posted = _manual_upload_rig(tmp_path, monkeypatch, max_per_day=2)
     clip = tmp_path / "clip_twitch_kosky_x_keyword.mp4"
     clip.write_bytes(b"\x00")
 
     for _ in range(3):
-        api._do_upload(str(clip), ["tiktok"])
+        assert api.upload_clip(str(clip), ["tiktok"])["ok"] is True
+    while api._publish_queue.run_once():
+        pass
 
     assert len(posted) == 2, f"{len(posted)} posts com limite diário de 2"
     counts = json.loads((tmp_path / "ClipBot" / "publish_counts.json").read_text(encoding="utf-8"))
     assert counts["counts"]["tiktok"] == 2
+    assert len(api._publish_queue.pending()) == 1, "o post além do limite deveria esperar amanhã"

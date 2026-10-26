@@ -29,6 +29,7 @@ from bot_engine import BotEngine
 # ── Pending store compartilhado entre sessões do engine ──────────────────────
 # bot_engine já inseriu core/ no sys.path quando foi importado acima.
 from pending_store import PendingStore
+from publish_queue import PublishQueue
 from feedback import load_weights, score_moment, apply_feedback as _apply_fb
 
 _STORE = PendingStore()   # singleton — carrega pending.json do disco na inicialização
@@ -121,12 +122,94 @@ def _ensure_video_server() -> int:
     return _VIDEO_SERVER_PORT
 
 
+# ─── Publicador da fila (Patch 6) ─────────────────────────────────────────────
+#
+# A única peça que sabe COMO postar. Trocar o destino (uploaders atuais, API
+# oficial da Meta, upload-post) muda só aqui; fila, intervalo, retry e teto
+# diário ficam iguais.
+
+_UPLOADERS: dict = {}     # plataforma → instância (o login do instagrapi é caro)
+
+
+def _publisher_config() -> dict:
+    return BotEngine._build_config(load_settings(), load_credentials())
+
+
+def _delay_between_posts() -> float:
+    try:
+        return float(_publisher_config()["upload"].get("delay_between_posts", 300) or 0)
+    except Exception:
+        return 300.0
+
+
+def _cleanup_after_upload() -> bool:
+    try:
+        return bool(_publisher_config()["system"].get("cleanup_after_upload", False))
+    except Exception:
+        return False
+
+
+def _publish_one(job: dict, plat: str):
+    """
+    Publica um (job, plataforma) da fila.
+
+    Returns:
+        None se o teto diário recusou (a fila adia para amanhã); senão o
+        resultado do upload. Descrição gerada aqui, fora do loop do canal.
+    """
+    import uploader as _up
+    config = _publisher_config()
+    limits = _up.DailyPublishLimit(config["upload"].get("max_clips_per_day"))
+    if not limits.has_room(plat):
+        return None
+
+    clip = Path(job["clip"])
+    title, caption, tags = job.get("title") or None, None, None
+    try:
+        from description_generator import DescriptionGenerator
+        desc = DescriptionGenerator(config).generate(
+            video_path=clip, platform=plat,
+            channel=job.get("channel") or "", reason=job.get("reason") or "",
+        )
+        title   = title or desc.get("title")
+        caption = desc.get("caption")
+        tags    = desc.get("hashtags")
+    except Exception as e:
+        logger.debug(f"descrição para {plat} falhou: {e}")
+
+    cls = {"tiktok": _up.TikTokUploader, "instagram": _up.InstagramUploader,
+           "youtube": _up.YouTubeUploader}.get(plat)
+    if cls is None:
+        raise ValueError(f"plataforma sem uploader: {plat}")
+    up = _UPLOADERS.get(plat)
+    if not isinstance(up, cls):
+        up = _UPLOADERS[plat] = cls(config)
+
+    post = {
+        "tiktok":    lambda: up.upload(clip, caption, tags),
+        "instagram": lambda: up.upload(clip, caption),
+        "youtube":   lambda: up.upload(clip, title, caption),
+    }[plat]
+    return _up.publish_with_limit(limits, plat, post)
+
+
 class ClipBotAPI:
 
     def __init__(self):
         self._window   = None
         self._engine: Optional[BotEngine] = None
         self._poll_timer: Optional[threading.Timer] = None
+        # Fila de publicação única do app (Patch 6): upload manual e modo
+        # automático passam por ela. Posts que ficaram na fila de uma sessão
+        # anterior voltam a andar assim que o app abre.
+        self._publish_queue = PublishQueue(
+            _publish_one,
+            delay_fn=_delay_between_posts,
+            cleanup_fn=_cleanup_after_upload,
+            on_result=self._on_publish_result,
+        )
+        if self._publish_queue.pending():
+            self._publish_queue.start()
         # Motivo, se a config entregue à UI veio dos defaults por falha de
         # leitura. Ver config_for_ui / save_config.
         self._ui_config_problem: Optional[str] = None
@@ -312,7 +395,9 @@ class ClipBotAPI:
             on_clip_posted    = self._on_clip,
             on_moment_pending = self._on_moment_pending,
             pending_store     = _STORE,
+            publish_queue     = self._publish_queue,
         )
+        self._publish_queue.start()
         self._engine.start(settings, credentials)
         self._start_poll()
         return {"ok": True}
@@ -355,13 +440,35 @@ class ClipBotAPI:
         return clips
 
     def upload_clip(self, path: str, platforms: list) -> dict:
-        """Upload manual — dispara thread daemon e retorna imediatamente."""
-        threading.Thread(
-            target=self._do_upload,
-            args=(path, platforms),
-            daemon=True,
-        ).start()
-        return {"ok": True}
+        """
+        Upload manual — entra na fila de publicação e retorna na hora. O
+        resultado de cada plataforma chega à UI por onUploadResult.
+        """
+        job_id = self._publish_queue.enqueue(path, platforms)
+        if not job_id:
+            return {"ok": False, "error": "Nenhuma plataforma selecionada"}
+        self._publish_queue.start()
+        return {"ok": True, "queued": job_id}
+
+    def _on_publish_result(self, job: dict, plat: str, ok, why) -> None:
+        """Resultado de um post da fila → log da UI, onUploadResult e funil."""
+        clip = Path(job["clip"]).name
+        if ok is None:
+            self._on_log("WARNING", f"⏸ {plat}: {why} — {clip}")
+        elif ok:
+            self._on_log("INFO", f"✅ {plat}: postado — {clip}")
+        else:
+            self._on_log("ERROR", f"❌ {plat}: {why} — {clip}")
+        payload = {"platform": plat, "ok": bool(ok), "clip": clip,
+                   "pending": ok is None, "reason": why}
+        self._js(f"onUploadResult({json.dumps(payload)})")
+        if ok and self._engine is not None and job.get("label"):
+            try:
+                self._engine._funnel(job["label"], "published",
+                                     platform=job["label"].split(":")[0].lower(),
+                                     channel=job.get("channel", ""))
+            except Exception as e:
+                logger.debug(f"funil published: {e}")
 
     def delete_clip(self, path: str) -> dict:
         try:
@@ -568,51 +675,3 @@ class ClipBotAPI:
             self._poll_timer.daemon = True
             self._poll_timer.start()
 
-    # ─── Upload interno (thread) ──────────────────────────────────────────────
-
-    def _do_upload(self, path: str, platforms: list):
-        video = Path(path)
-        settings    = load_settings()
-        credentials = load_credentials()
-
-        # Uploaders esperam o config transformado por _build_config, NÃO load_settings() cru.
-        # _build_config é @staticmethod — chama direto na classe, sem instanciar BotEngine
-        config = BotEngine._build_config(settings, credentials)
-
-        # O mesmo teto diário do modo automático (antes o upload manual não
-        # consultava limite nenhum).
-        import uploader as _up
-        limits = _up.DailyPublishLimit(config["upload"].get("max_clips_per_day"))
-        makers = {
-            "tiktok":    lambda: _up.TikTokUploader(config).upload(video),
-            "youtube":   lambda: _up.YouTubeUploader(config).upload(video),
-            "instagram": lambda: _up.InstagramUploader(config).upload(video),
-        }
-
-        for plat in platforms:
-            self._on_log("INFO", f"📤 Upload manual → {plat}: {video.name}")
-            try:
-                ok = False
-                if plat in makers:
-                    res = _up.publish_with_limit(limits, plat, makers[plat])
-                    if res is None:
-                        self._on_log(
-                            "WARNING",
-                            f"⏸ {plat}: limite diário de "
-                            f"{limits.limit_for(plat)} post(s) atingido — upload não feito "
-                            "(ajuste em Max clips/dia)",
-                        )
-                        self._js(f"onUploadResult({json.dumps({'platform': plat, 'ok': False, 'clip': video.name, 'reason': 'daily_limit'})})")
-                        continue
-                    ok = res
-
-                icon = "✅" if ok else "❌"
-                self._on_log(
-                    "INFO" if ok else "ERROR",
-                    f"{icon} {plat}: {'concluído' if ok else 'falhou'}",
-                )
-                self._js(f"onUploadResult({json.dumps({'platform': plat, 'ok': ok, 'clip': video.name})})")
-
-            except Exception as e:
-                self._on_log("ERROR", f"❌ {plat}: {e}")
-                self._js(f"onUploadResult({json.dumps({'platform': plat, 'ok': False, 'clip': video.name})})")
