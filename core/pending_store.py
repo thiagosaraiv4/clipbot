@@ -80,12 +80,19 @@ class PendingStore:
 
     # ── Escrita ───────────────────────────────────────────────────────────────
 
-    def add(self, moment, raw_file: Path, platform: str, channel: str) -> bool:
+    def add(self, moment, raw_file: Path, platform: str, channel: str,
+            segment: tuple = None) -> bool:
         """
         Adiciona momento se ainda não presente.
         Retorna True se inserido, False se já existia.
+
+        segment: (start, end) do que foi REALMENTE extraído para o .ts. Difere
+            do momento quando houve padding para atingir min_clip_duration —
+            e é essa janela que descreve o arquivo no disco. Omitido = sem
+            padding (segmento == momento).
         """
         mid = moment.moment_id
+        seg_start, seg_end = segment if segment else (moment.start_sec, moment.end_sec)
         with self._lock:
             if mid in self._data:
                 return False
@@ -93,6 +100,9 @@ class PendingStore:
                 "moment_id": mid,
                 "start_sec": moment.start_sec,
                 "end_sec":   moment.end_sec,
+                # Janela do arquivo (≠ momento quando houve padding)
+                "segment_start_sec": seg_start,
+                "segment_end_sec":   seg_end,
                 "reason":    moment.reason,
                 "score":     moment.score,
                 "keywords":  list(moment.keywords),
@@ -257,6 +267,11 @@ class PendingStore:
             if not raw_path.exists():
                 logger.debug(f"pending: raw_file ausente, descartando {mid[:8]}")
                 continue
+            # Entradas de versões anteriores não têm a janela do segmento.
+            # Sem padding conhecido, o palpite honesto é o próprio momento —
+            # o mesmo valor que aquelas versões gravavam no sidecar.
+            e.setdefault("segment_start_sec", e.get("start_sec"))
+            e.setdefault("segment_end_sec", e.get("end_sec"))
             self._data[mid] = e
             recovered += 1
         if recovered:

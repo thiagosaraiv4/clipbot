@@ -936,17 +936,17 @@ class BotEngine:
                                 raw_clip = clips_dir / f"raw_{raw_name}.ts"
 
                                 min_dur = config["detection"]["audio_spike"]["min_clip_duration"]
-                                seg_start, seg_end = m.start_sec, m.end_sec
-                                if (seg_end - seg_start) < min_dur:
-                                    pad       = (min_dur - (seg_end - seg_start)) / 2
-                                    seg_start = max(0.0, seg_start - pad)
-                                    seg_end   = seg_end + pad
+                                seg_start, seg_end = self._segment_bounds(
+                                    m.start_sec, m.end_sec, min_dur,
+                                    available=capture.get_elapsed_seconds(),
+                                )
 
                                 capture.extract_segment(raw_file, seg_start, seg_end, raw_clip)
                                 self._funnel(label, "detected", platform=platform, channel=clean)
                                 self._funnel(label, "extracted", platform=platform, channel=clean)
 
-                                self.pending_store.add(m, raw_clip, platform, clean)
+                                self.pending_store.add(m, raw_clip, platform, clean,
+                                                       segment=(seg_start, seg_end))
                                 self._funnel(label, "pending_queued",
                                              platform=platform, channel=clean)
                                 entry = self.pending_store.get(m.moment_id)
@@ -996,11 +996,10 @@ class BotEngine:
                             raw_clip = clips_dir / f"raw_{name}.ts"
 
                             min_dur = config["detection"]["audio_spike"]["min_clip_duration"]
-                            start, end = m.start_sec, m.end_sec
-                            if (end - start) < min_dur:
-                                pad   = (min_dur - (end - start)) / 2
-                                start = max(0.0, start - pad)
-                                end   = end + pad
+                            start, end = self._segment_bounds(
+                                m.start_sec, m.end_sec, min_dur,
+                                available=capture.get_elapsed_seconds(),
+                            )
 
                             # ── ClipBot v3: Reaction + Hook + QualityGate ───
                             ca_cfg = config["editing"].get("clip_analysis", {})
@@ -1239,6 +1238,54 @@ class BotEngine:
     # Geração de clip a partir de momento pendente (chamado pela API)
     # ──────────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _segment_bounds(start_sec: float, end_sec: float, min_dur: float,
+                        available: float = None) -> tuple:
+        """
+        Janela a extrair para o .ts, com padding até min_clip_duration.
+
+        O padding é centrado no momento, com duas correções que vêm do clip de
+        12/08 (15s declarados no sidecar, ~36s de vídeo entregue):
+
+          • Cabeça que não cabe é compensada na cauda. `max(0.0, start - pad)`
+            descartava duração em silêncio, e o min_clip_duration configurado
+            não era respeitado nos primeiros minutos de stream.
+
+          • Cauda não pede além do que já foi capturado (`available`). Antes, a
+            janela ultrapassava a borda da live e o FFmpeg entregava só o que
+            existia — por isso o arquivo tinha 36s. A duração perdida é
+            recuperada puxando o início para trás, onde há material.
+
+        INVARIANTE: o retorno sempre contém [start_sec, end_sec]. Quando nem
+        assim a duração mínima cabe, o segmento devolvido é menor — e é essa
+        janela, a real, que vai para o sidecar.
+        """
+        dur = end_sec - start_sec
+        seg_start, seg_end = start_sec, end_sec
+
+        if dur < min_dur:
+            pad = (min_dur - dur) / 2.0
+            seg_start = start_sec - pad
+            seg_end   = end_sec + pad
+
+        if available is not None and seg_end > available:
+            # Nunca recorta o momento: se nem ele foi capturado por inteiro, o
+            # portão de candidatos (elapsed >= end_sec + 2) já teria barrado.
+            seg_end   = max(end_sec, available)
+            deficit   = min_dur - (seg_end - seg_start)
+            if deficit > 0:
+                seg_start -= deficit
+
+        if seg_start < 0.0:
+            # Compensa na cauda o que não couber antes de zero, sem voltar a
+            # passar do material disponível.
+            seg_end = max(seg_end, min(seg_end - seg_start,
+                                       available if available is not None
+                                       else seg_end - seg_start))
+            seg_start = 0.0
+
+        return seg_start, seg_end
+
     def generate_clip_from_moment(self, moment_id: str,
                                    title_text: str = None) -> dict:
         """
@@ -1358,14 +1405,23 @@ class BotEngine:
             # ── Sidecar JSON ──────────────────────────────────────────────────
             sidecar = edited.with_suffix(".json")
             reasons  = entry.get("extra", {}).get("reasons", [entry["reason"]])
+            seg_start = entry.get("segment_start_sec", entry["start_sec"])
+            seg_end   = entry.get("segment_end_sec", entry["end_sec"])
             sidecar.write_text(json.dumps({
                 "moment_id":    moment_id,
                 "reason":       entry["reason"],
                 "reasons":      reasons,
                 "platform":     entry["platform"],
                 "channel":      entry["channel"],
+                # Momento: ONDE está o evento. Segmento: o que o arquivo cobre.
+                # Eram a mesma coisa aqui, e com padding para min_clip_duration
+                # o número declarado não batia com o vídeo entregue (15s
+                # declarados, ~36s no arquivo, em 12/08).
                 "start_sec":    entry["start_sec"],
                 "end_sec":      entry["end_sec"],
+                "segment_start_sec":    seg_start,
+                "segment_end_sec":      seg_end,
+                "segment_duration_sec": round(seg_end - seg_start, 1),
                 "base_score":   round(entry["score"], 4),
                 "final_score":  round(final_score, 4),
                 "keywords":     entry.get("keywords", []),
