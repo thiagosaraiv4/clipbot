@@ -788,9 +788,50 @@ class BotEngine:
             ch = ch.replace(c, "_")
         return ch or "canal"
 
+    # Tempos do monitor por canal. Atributos (não locais) para os testes
+    # encurtarem — o comportamento é o mesmo, só mais rápido.
+    _TICK_SEC           = 1.0
+    _RETRY_BACKOFF_INIT = 30.0
+    _RETRY_BACKOFF_MAX  = 600.0    # 10min teto
+    _CRASH_BACKOFF_INIT = 30.0
+    _CRASH_BACKOFF_MAX  = 600.0
+
     def _monitor_platform(self, platform: str, channel: str,
                            clips_dir: Path, editor, uploader, desc_gen,
                            title_gen=None, config: dict = None) -> None:
+        """
+        Thread de um canal: roda o monitor e o reinicia se ele cair.
+
+        Rede de segurança para o que fica fora do loop interno de
+        _monitor_platform_attempts (construtor da captura, backoff, cleanup).
+        Antes, uma exceção ali encerrava a thread em silêncio — com vários
+        canais, um deles simplesmente parava; com um só, o engine parava.
+        """
+        clean = self._clean_channel_name(channel)
+        label = f"{platform.upper()}:{clean}"
+        delay = self._CRASH_BACKOFF_INIT
+        while not self._stop_event.is_set():
+            try:
+                self._monitor_platform_attempts(
+                    platform, channel, clips_dir, editor, uploader, desc_gen,
+                    title_gen=title_gen, config=config,
+                )
+                return
+            except Exception:
+                logger.exception(
+                    f"❌ [{label}] Monitor do canal caiu com erro inesperado; "
+                    f"reiniciando em {delay:.0f}s"
+                )
+                _metrics_incr("capture.monitor_crash", platform=platform)
+                self._funnel(label, "errors", platform=platform, channel=clean)
+                self._touch_channel(label, state="reconnecting")
+                if self._stop_event.wait(timeout=delay):
+                    return
+                delay = min(self._CRASH_BACKOFF_MAX, delay * 2)
+
+    def _monitor_platform_attempts(self, platform: str, channel: str,
+                                   clips_dir: Path, editor, uploader, desc_gen,
+                                   title_gen=None, config: dict = None) -> None:
         """
         Monitora UM canal em sua própria thread, com **auto-restart**.
 
@@ -817,8 +858,8 @@ class BotEngine:
         label    = f"{platform.upper()}:{clean}"
 
         # ── Estado do loop de retry (escopo da thread) ────────────────────────
-        _RETRY_BACKOFF_INIT = 30.0
-        _RETRY_BACKOFF_MAX  = 600.0   # 10min teto
+        _RETRY_BACKOFF_INIT = self._RETRY_BACKOFF_INIT
+        _RETRY_BACKOFF_MAX  = self._RETRY_BACKOFF_MAX
         _RETRY_BACKOFF_MULT = 2.0
         _RETRY_RESET_AFTER  = 300.0   # 5min de uptime resetam backoff
         backoff_s = _RETRY_BACKOFF_INIT
@@ -852,14 +893,7 @@ class BotEngine:
                 backoff_s = min(_RETRY_BACKOFF_MAX, backoff_s * _RETRY_BACKOFF_MULT)
                 continue
 
-            # platform/channel explícitos: o detector de chat da Twitch só é
-            # criado para threads da Twitch, no canal DESTA thread (P1-4).
-            detector = MomentDetector(
-                cfg, elapsed_fn=capture.get_elapsed_seconds,
-                platform=platform, channel=channel,
-            )
-            detector.start(raw_file)
-            self._touch_channel(label, state="capturing", attempt=attempt)
+            detector = None   # criado dentro do try (ver abaixo)
 
             approval_mode  = config.get("system", {}).get("approval_mode", False)
             approval_top_n = int(config.get("system", {}).get("approval_top_n", 12))
@@ -878,8 +912,20 @@ class BotEngine:
             _wd_state = "ok"               # "ok" | "frozen"
 
             try:
+                # Dentro do try: se o detector não subir, o finally ainda para
+                # a captura. Antes ficava fora — a thread morria com o ffmpeg
+                # rodando.
+                # platform/channel explícitos: o detector de chat da Twitch só é
+                # criado para threads da Twitch, no canal DESTA thread (P1-4).
+                detector = MomentDetector(
+                    cfg, elapsed_fn=capture.get_elapsed_seconds,
+                    platform=platform, channel=channel,
+                )
+                detector.start(raw_file)
+                self._touch_channel(label, state="capturing", attempt=attempt)
+
                 while not self._stop_event.is_set():
-                    self._stop_event.wait(timeout=1)
+                    self._stop_event.wait(timeout=self._TICK_SEC)
                     if self._stop_event.is_set():
                         break
 
@@ -1014,25 +1060,27 @@ class BotEngine:
                             f"{m.start_sec:.1f}s → {m.end_sec:.1f}s  score={m.score:.2f}"
                         )
 
-                        # Score avançado com recency e chat
-                        from feedback import score_moment_advanced
-                        secs_since = (time.time() - last_clip_time) if last_clip_time > 0 else None
-                        chat_ratio = None
-                        if hasattr(detector, 'chat') and detector.chat and hasattr(detector.chat, 'chat_rate_ratio'):
-                            chat_ratio = detector.chat.chat_rate_ratio
-                        adv_score = score_moment_advanced(
-                            {"reason": m.reason, "score": m.score},
-                            duration=m.end_sec - m.start_sec,
-                            seconds_since_last_clip=secs_since,
-                            chat_rate_ratio=chat_ratio,
-                            channel=channel,
-                        )
-                        if adv_score < 0.15:
-                            logger.info(f"⏭️ [{label}] Score avançado muito baixo ({adv_score:.3f}), pulando")
-                            self._funnel(label, "score_gate", platform=platform, channel=clean)
-                            continue
-
                         try:
+                            # Score avançado com recency e chat. Dentro do try:
+                            # chat_rate_ratio lê estado da thread do IRC, e um
+                            # erro aqui deve pular ESTE momento, não o canal.
+                            from feedback import score_moment_advanced
+                            secs_since = (time.time() - last_clip_time) if last_clip_time > 0 else None
+                            chat_ratio = None
+                            if hasattr(detector, 'chat') and detector.chat and hasattr(detector.chat, 'chat_rate_ratio'):
+                                chat_ratio = detector.chat.chat_rate_ratio
+                            adv_score = score_moment_advanced(
+                                {"reason": m.reason, "score": m.score},
+                                duration=m.end_sec - m.start_sec,
+                                seconds_since_last_clip=secs_since,
+                                chat_rate_ratio=chat_ratio,
+                                channel=channel,
+                            )
+                            if adv_score < 0.15:
+                                logger.info(f"⏭️ [{label}] Score avançado muito baixo ({adv_score:.3f}), pulando")
+                                self._funnel(label, "score_gate", platform=platform, channel=clean)
+                                continue
+
                             ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
                             name     = f"clip_{platform}_{clean}_{ts}_{m.reason}"
                             raw_clip = clips_dir / f"raw_{name}.ts"
@@ -1227,6 +1275,19 @@ class BotEngine:
 
             except KeyboardInterrupt:
                 logger.info(f"⌨️  [{label}] Ctrl+C na thread do canal.")
+            except Exception:
+                # Qualquer outro erro reinicia o canal pelo retry externo, com
+                # backoff. Antes ele atravessava o finally e encerrava a thread
+                # — o log dizia "Encerrado." como num stop normal e o painel
+                # de saúde continuava em "capturing".
+                logger.exception(
+                    f"❌ [{label}] Erro inesperado no monitor (attempt #{attempt}); "
+                    "reiniciando o canal"
+                )
+                _metrics_incr("capture.loop_crash", platform=platform)
+                self._funnel(label, "errors", platform=platform, channel=clean)
+                self._touch_channel(label, state="reconnecting", attempt=attempt)
+                _restart_now = True
             finally:
                 # Cleanup imediato do attempt — não depende de atexit
                 if _restart_now:
@@ -1234,7 +1295,8 @@ class BotEngine:
                 else:
                     logger.info(f"⏹ [{label}] Encerrando detector e captura...")
                 try:
-                    detector.stop()
+                    if detector is not None:
+                        detector.stop()
                 except Exception as e:
                     logger.debug(f"detector.stop: {e}")
                 try:

@@ -574,7 +574,11 @@ class TwitchChatDetector:
             return 0.0
         win = self.cfg_flood["window_seconds"]
         now = time.time()
-        count = sum(1 for t in self._msg_times if now - t <= win)
+        # Snapshot atômico (tuple() copia o deque em C, sem soltar o GIL). A
+        # thread do IRC faz append/popleft neste deque; iterar com gerador
+        # quebrava com "deque mutated during iteration" e derrubava o canal.
+        snap = tuple(self._msg_times)
+        count = sum(1 for t in snap if now - t <= win)
         return count / win
 
     @property
