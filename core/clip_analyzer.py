@@ -7,6 +7,7 @@ PR3d: motion + audio RMS migrados de loop Python para numpy.
 """
 import logging
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -20,13 +21,28 @@ logger = logging.getLogger("clipbot.clip_analyzer")
 # Helpers internos
 # ──────────────────────────────────────────────────────────────────────
 
-def _extract_audio_rms(video_path, start_sec: float, duration: float) -> float:
-    """Extrai áudio mono PCM f32le e calcula RMS via numpy vetorizado."""
+# Medição × contrato de score
+# ───────────────────────────
+# _measure_* devolvem None quando NÃO conseguiram medir (ffmpeg com rc≠0,
+# timeout, sem trilha, poucos dados, exceção) — diferente de "mediu zero".
+# Os portões destrutivos (is_offline_screen, quality_gate) usam essas versões:
+# falha de medição não pode descartar um clip e apagar o .ts dele.
+# _extract_* mantêm o contrato float (0.0 quando não mediu) dos scorers
+# (compute_reaction_score, find_hook_start), que fazem conta com o retorno.
+
+def _measure_audio_rms(video_path, start_sec: float, duration: float) -> Optional[float]:
+    """RMS do áudio mono, ou None se não foi possível medir."""
     with _Timer("analyzer.audio_rms"):
-        return _extract_audio_rms_impl(video_path, start_sec, duration)
+        return _measure_audio_rms_impl(video_path, start_sec, duration)
 
 
-def _extract_audio_rms_impl(video_path, start_sec: float, duration: float) -> float:
+def _extract_audio_rms(video_path, start_sec: float, duration: float) -> float:
+    """Extrai áudio mono PCM f32le e calcula RMS (0.0 quando não mediu)."""
+    v = _measure_audio_rms(video_path, start_sec, duration)
+    return 0.0 if v is None else v
+
+
+def _measure_audio_rms_impl(video_path, start_sec: float, duration: float) -> Optional[float]:
     cmd = [
         "ffmpeg", "-ss", str(start_sec), "-i", str(video_path),
         "-t", str(duration),
@@ -39,34 +55,41 @@ def _extract_audio_rms_impl(video_path, start_sec: float, duration: float) -> fl
         result = run_ffmpeg(cmd, label="audio_rms",
                             timeout=15, capture_stdout=True, quiet=True)
         if not result.ok or len(result.stdout) < 4:
-            return 0.0
+            return None
 
         # Trunca para múltiplo de 4 bytes (sample float32) para evitar erro do frombuffer
         raw_len = (len(result.stdout) // 4) * 4
         if raw_len == 0:
-            return 0.0
+            return None
         audio = np.frombuffer(result.stdout[:raw_len], dtype=np.float32)
         if audio.size == 0:
-            return 0.0
+            return None
         # RMS = sqrt(mean(x^2)) — totalmente vetorizado
         return float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
 
     except Exception as e:
         logger.debug(f"Erro RMS: {e}")
-        return 0.0
+        return None
 
 
-def _extract_motion_score(video_path, start_sec: float, duration: float) -> float:
+def _measure_motion(video_path, start_sec: float, duration: float) -> Optional[float]:
     """
     Extrai frames a 2fps em grayscale 160x90 e calcula motion como
     média das diferenças absolutas entre frames consecutivos.
     Implementação numpy vetorizada (~50× mais rápida que loop Python).
+    None se não foi possível medir.
     """
     with _Timer("analyzer.motion"):
-        return _extract_motion_score_impl(video_path, start_sec, duration)
+        return _measure_motion_impl(video_path, start_sec, duration)
 
 
-def _extract_motion_score_impl(video_path, start_sec: float, duration: float) -> float:
+def _extract_motion_score(video_path, start_sec: float, duration: float) -> float:
+    """Motion score com contrato float (0.0 quando não mediu)."""
+    v = _measure_motion(video_path, start_sec, duration)
+    return 0.0 if v is None else v
+
+
+def _measure_motion_impl(video_path, start_sec: float, duration: float) -> Optional[float]:
     FRAME_W = 160
     FRAME_H = 90
     FRAME_SIZE = FRAME_W * FRAME_H
@@ -83,13 +106,13 @@ def _extract_motion_score_impl(video_path, start_sec: float, duration: float) ->
         result = run_ffmpeg(cmd, label="motion_score",
                             timeout=20, capture_stdout=True, quiet=True)
         if not result.ok or len(result.stdout) < FRAME_SIZE * 2:
-            return 0.0
+            return None
 
         # Trunca para múltiplo de FRAME_SIZE
         raw = result.stdout
         n_frames = len(raw) // FRAME_SIZE
         if n_frames < 2:
-            return 0.0
+            return None
 
         usable = raw[:n_frames * FRAME_SIZE]
         # uint8 → int16 para diff sem overflow; reshape (n_frames, FRAME_SIZE)
@@ -100,7 +123,7 @@ def _extract_motion_score_impl(video_path, start_sec: float, duration: float) ->
 
     except Exception as e:
         logger.debug(f"Erro motion: {e}")
-        return 0.0
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -275,18 +298,29 @@ def is_offline_screen(video_path, duration_sec: float = 8.0,
     """
     video_path = Path(video_path)
 
-    motion_mean = _extract_motion_score(video_path, 0.0, duration_sec)
+    motion_mean = _measure_motion(video_path, 0.0, duration_sec)
+    m_txt = "não medido" if motion_mean is None else f"{motion_mean:.2f}"
 
     # Audio: extrai 1× e calcula mean + cv num passo só (evita 2× ffmpeg)
     rms_mean, audio_cv = _audio_rms_and_cv(video_path, 0.0, duration_sec)
 
-    # Caminho A: silêncio absoluto (super forte; quase 0 falsos positivos)
+    # Os dois chamadores são destrutivos (apagam o .ts). Falha de medição —
+    # timeout sob carga, clip sem trilha de áudio — não é evidência de nada.
+    # Antes, ela virava rms=0.0 e o Caminho A a lia como silêncio absoluto.
+    if rms_mean is None:
+        return (False, f"motion={m_txt} áudio não medido → gate não aplicado")
+
+    # Caminho A: silêncio absoluto MEDIDO (super forte; quase 0 falsos positivos)
     if rms_mean < audio_silence_max:
         info = (
-            f"motion={motion_mean:.2f} rms_mean={rms_mean:.5f} "
+            f"motion={m_txt} rms_mean={rms_mean:.5f} "
             f"(silêncio < {audio_silence_max}) → OFFLINE SCREEN"
         )
         return (True, info)
+
+    if motion_mean is None:
+        return (False, f"motion não medido rms={rms_mean:.4f} "
+                       f"audio_cv={audio_cv:.3f} → gate não aplicado")
 
     # Caminho B: motion estática + audio loop (música/efeito constante)
     motion_static = motion_mean < motion_max
@@ -306,6 +340,9 @@ def _audio_rms_and_cv(video_path, start_sec: float, duration: float) -> tuple:
     """
     Extrai áudio 1× e retorna (rms_mean, rms_cv) — evita 2× ffmpeg.
     rms_cv = coefficient of variation (std/mean) por chunks de 1s.
+
+    (None, None) quando não foi possível medir; (0.0, 0.0) é silêncio
+    digital MEDIDO. Os dois não podem ser confundidos (ver is_offline_screen).
     """
     video_path = Path(video_path)
     cmd = [
@@ -319,7 +356,7 @@ def _audio_rms_and_cv(video_path, start_sec: float, duration: float) -> tuple:
         result = run_ffmpeg(cmd, label="audio_rms_cv",
                             timeout=15, capture_stdout=True, quiet=True)
         if not result.ok or len(result.stdout) < 16000 * 4 * 2:
-            return (0.0, 1.0)
+            return (None, None)
 
         raw_len = (len(result.stdout) // 4) * 4
         audio = np.frombuffer(result.stdout[:raw_len], dtype=np.float32)
@@ -327,7 +364,7 @@ def _audio_rms_and_cv(video_path, start_sec: float, duration: float) -> tuple:
         chunk_size = 16000
         n_chunks = audio.size // chunk_size
         if n_chunks < 2:
-            return (0.0, 1.0)
+            return (None, None)
 
         chunks = audio[: n_chunks * chunk_size].reshape(n_chunks, chunk_size).astype(np.float64)
         rms_per_chunk = np.sqrt(np.mean(np.square(chunks), axis=1))
@@ -338,7 +375,7 @@ def _audio_rms_and_cv(video_path, start_sec: float, duration: float) -> tuple:
 
     except Exception as e:
         logger.debug(f"Erro audio_rms_and_cv: {e}")
-        return (0.0, 1.0)
+        return (None, None)
 
 
 def quality_gate(raw_clip_path, min_rms: float = 0.01,
@@ -353,8 +390,17 @@ def quality_gate(raw_clip_path, min_rms: float = 0.01,
     # Medir nos primeiros 4 segundos
     check_dur = 4.0
 
-    rms = _extract_audio_rms(raw_clip_path, 0, check_dur)
-    motion = _extract_motion_score(raw_clip_path, 0, check_dur)
+    rms = _measure_audio_rms(raw_clip_path, 0, check_dur)
+    motion = _measure_motion(raw_clip_path, 0, check_dur)
+
+    # Descarte exige as DUAS medições (o critério é silêncio E imagem parada).
+    # Antes, duas falhas de ffmpeg sob carga davam 0.0 + 0.0 = "silence+static".
+    if rms is None or motion is None:
+        logger.info(
+            f"🔍 QualityGate: medição incompleta (rms={'não medido' if rms is None else f'{rms:.4f}'}, "
+            f"motion={'não medido' if motion is None else f'{motion:.2f}'}) — não descarta"
+        )
+        return (True, "")
 
     logger.debug(f"🔍 QualityGate: rms={rms:.4f} (min={min_rms}) motion={motion:.2f} (min={min_motion})")
 
