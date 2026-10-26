@@ -1172,8 +1172,16 @@ class MomentDetector:
         self.channel    = channel
         self._detectors = []
         self._announced: dict = {}   # chave do evento → timestamp do anúncio
+        # moment_ids de momentos brutos já processados pelo engine (ver consume)
+        self._consumed: set = set()
 
         det = config["detection"]
+        # Quanto antes do gatilho um momento novo pode começar — define quando
+        # um grupo está fechado para novos membros (ver is_settled).
+        self._max_buffer_before = max(
+            float((det.get(k) or {}).get("buffer_before", 0) or 0)
+            for k in ("audio_spike", "chat_flood")
+        )
 
         self.audio = None
         if det["audio_spike"]["enabled"]:
@@ -1251,6 +1259,15 @@ class MomentDetector:
             if src is not None:
                 moments.extend(src.get_moments_snapshot())
 
+        # Membros já processados saem do merge: a identidade de um grupo é o
+        # conjunto dos seus membros, e um membro consumido nunca volta a
+        # formar (ou alongar) outro grupo. Os ids que os detectores já podaram
+        # por TTL saem do conjunto aqui — ele não cresce sem limite.
+        present = {m.moment_id for m in moments}
+        self._consumed &= present
+        if self._consumed:
+            moments = [m for m in moments if m.moment_id not in self._consumed]
+
         moments.sort(key=lambda m: m.start_sec)
         merged = self._merge_moments(
             moments, max_duration=getattr(self, "_max_duration", None)
@@ -1262,6 +1279,34 @@ class MomentDetector:
             logger.debug(f"anúncio de merge falhou: {ex}")
         return merged
 
+    # ── Identidade e liberação (usados pelo engine) ─────────────────────────
+
+    @staticmethod
+    def members(m: Moment) -> tuple:
+        """
+        Identidade de um momento fundido: os moment_ids dos momentos brutos
+        que o formam. Estável entre ticks, ao contrário de (start, reason), que
+        mudava quando o grupo crescia ou ganhava outro reason.
+        """
+        return tuple(sorted((m.extra or {}).get("members") or (m.moment_id,)))
+
+    def consume(self, m: Moment) -> None:
+        """Marca os membros de `m` como processados: saem dos merges futuros."""
+        self._consumed.update(self.members(m))
+
+    def is_settled(self, m: Moment, elapsed: float) -> bool:
+        """
+        True quando nenhum momento futuro consegue mais entrar no grupo.
+
+        Um momento criado em t começa em t - buffer_before e entra no grupo se
+        começar até group_end + MERGE_DIST. Liberar antes disso (o gate antigo
+        era end + 2 s) deixava o grupo crescer DEPOIS de processado: ou ganhava
+        chave nova e virava clip duplicado, ou mantinha a chave e o membro novo
+        era engolido.
+        """
+        end = float((m.extra or {}).get("group_end", m.end_sec))
+        return elapsed >= end + self.MERGE_DIST + self._max_buffer_before + 2.0
+
     # ── Algoritmo de merge (sweep-line) ──────────────────────────────────────
 
     @staticmethod
@@ -1269,11 +1314,17 @@ class MomentDetector:
                        max_duration: float = None) -> List[Moment]:
         """
         Sweep-line: acumula grupo enquanto próximo momento tiver overlap
-        OU start <= end_do_grupo + MERGE_DIST.
+        OU start <= end_do_grupo + MERGE_DIST — e enquanto o grupo inteiro
+        couber em max_duration.
 
         max_duration (P1-6): teto do momento resultante. Default = 60s
         (clip_max_sec padrão). Sem ele, flood contínuo encadeava grupos sem
         limite — produção registrou 82s e 136s.
+
+        Teto de EXTENSÃO do grupo (B3): antes o grupo crescia sem limite e só a
+        janela final era truncada. Chat comum ("kkkk" a cada 20 s) encadeava a
+        live inteira num grupo só, e o engine soltava um clip em 5 minutos.
+        Agora um membro que estenderia o grupo além do teto abre um grupo novo.
         """
         if not moments:
             return []
@@ -1286,10 +1337,12 @@ class MomentDetector:
         group_end: float        = moments[0].end_sec
 
         for m in moments[1:]:
-            # Overlap ou dentro da janela de atração
-            if m.start_sec <= group_end + DIST:
+            # Overlap ou dentro da janela de atração, sem passar do teto
+            new_end = max(group_end, m.end_sec)
+            if (m.start_sec <= group_end + DIST
+                    and new_end - group[0].start_sec <= max_dur):
                 group.append(m)
-                group_end = max(group_end, m.end_sec)
+                group_end = new_end
             else:
                 result.append(MomentDetector._collapse(group, max_dur))
                 group     = [m]
@@ -1320,7 +1373,9 @@ class MomentDetector:
                 keywords=list(m.keywords),
                 extra={**m.extra,
                        "span_sec":    round(m.duration, 1),
-                       "group_start": round(m.start_sec, 1)},
+                       "group_start": round(m.start_sec, 1),
+                       "group_end":   m.end_sec,
+                       "members":     [m.moment_id]},
             )
 
         reasons   = {m.reason for m in group}
@@ -1349,6 +1404,8 @@ class MomentDetector:
                 "count":   len(group),
                 "span_sec":    round(g_end - g_start, 1),  # duração antes do teto
                 "group_start": round(g_start, 1),           # âncora estável do evento
+                "group_end":   g_end,                       # base do is_settled
+                "members":     [m.moment_id for m in group],  # identidade (B3)
             },
         )
 

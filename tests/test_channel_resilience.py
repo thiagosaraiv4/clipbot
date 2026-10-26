@@ -85,6 +85,17 @@ def _fakes(tmp_path, *, capture_init_fails=0, detector_start_fails=0,
         def stop(self):
             self.stopped = True
 
+        # Interface de identidade/liberação do MomentDetector real (B3).
+        @staticmethod
+        def members(m):
+            return (m.moment_id,)
+
+        def is_settled(self, m, elapsed):
+            return True
+
+        def consume(self, m):
+            pass
+
         @property
         def all_moments(self):
             self.calls += 1

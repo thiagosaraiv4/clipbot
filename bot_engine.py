@@ -1002,10 +1002,13 @@ class BotEngine:
                     if approval_mode:
                         candidates = []
                         for m in moments:
-                            key = (label, round(m.start_sec, 1), m.reason)
+                            # Identidade = membros (não start/reason, que mudavam
+                            # quando o grupo crescia) e só grupo FECHADO sai —
+                            # o gate antigo, end + 2 s, liberava grupo aberto.
+                            key = (label, detector.members(m))
                             if key in processed:
                                 continue
-                            if capture.get_elapsed_seconds() < m.end_sec + 2:
+                            if not detector.is_settled(m, capture.get_elapsed_seconds()):
                                 continue
                             candidates.append((key, m))
 
@@ -1013,6 +1016,7 @@ class BotEngine:
                         candidates.sort(key=lambda x: x[1].score, reverse=True)
                         for key, m in candidates[:approval_top_n]:
                             processed[key] = now_ts
+                            detector.consume(m)
                             logger.info(
                                 f"📋 [{label}] [{m.reason}] "
                                 f"{m.start_sec:.1f}s→{m.end_sec:.1f}s  "
@@ -1047,13 +1051,14 @@ class BotEngine:
 
                     # ── Modo automático: extrai e posta sem aprovação ─────────────
                     for m in moments:
-                        key = (label, round(m.start_sec, 1), m.reason)
+                        key = (label, detector.members(m))
                         if key in processed:
                             continue
-                        if capture.get_elapsed_seconds() < m.end_sec + 2:
+                        if not detector.is_settled(m, capture.get_elapsed_seconds()):
                             continue
 
                         processed[key] = now_ts
+                        detector.consume(m)
                         self._funnel(label, "detected", platform=platform, channel=clean)
                         logger.info(
                             f"🎯 [{label}] [{m.reason}] "
