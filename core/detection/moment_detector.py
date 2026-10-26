@@ -146,6 +146,8 @@ class AudioSpikeDetector:
     CHUNK_SECS     = 1.0
     CHUNK_BYTES    = int(SAMPLE_RATE * CHUNK_SECS) * 4   # float32
     BASELINE_WIN   = 60
+    BASELINE_MIN   = 15    # amostras VÁLIDAS antes de comparar (era 5)
+    SILENCE_DB     = -60.0 # abaixo disto não é referência de loudness
     IO_STALL_SEC   = 5.0   # tempo máximo sem chunk → reinicia
     QUEUE_POLL_SEC = 1.0   # timeout de cada get() na fila
     MOMENT_TTL_SEC = 300.0 # 5min: poda momentos com end_sec antes desse limiar
@@ -192,6 +194,59 @@ class AudioSpikeDetector:
                 if old_count > 10 or (old_count > 0 and old_count * 4 > len(self._moments)):
                     self._moments = [m for m in self._moments if m.end_sec >= cutoff]
             return list(self._moments)
+
+    # ── Análise de um chunk (puro, testável) ─────────────────────────────────
+
+    @staticmethod
+    def _chunk_db(raw: bytes) -> float:
+        """Nível rms do chunk em dBFS. Silêncio digital devolve o piso (-180)."""
+        import numpy as np
+        audio = np.frombuffer(raw, dtype=np.float32)
+        if audio.size == 0:
+            return -180.0
+        rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+        return float(20.0 * np.log10(rms + 1e-9))
+
+    def _consider_chunk(self, db: float, baseline: deque) -> Optional[dict]:
+        """
+        Decide se o chunk é um pico, atualizando o baseline.
+
+        Returns:
+            None quando não há pico (silêncio, aquecimento ou abaixo do
+            threshold); senão o dict que vira Moment.extra.
+
+        Dois gates nasceram de picos falsos medidos em produção
+        (audio.spike_db = 132.2 em 15/05 e 71.6 em 12/08, idêntico nas duas
+        capturas do dia — ver tests/test_audio_baseline.py):
+
+          1. Silêncio digital não entra no baseline. rms exatamente 0 produz
+             20*log10(0 + 1e-9) = -180 dB, que é artefato do epsilon e não
+             medição. Na média, ele fazia o primeiro chunk audível parecer um
+             salto de 70 a 130 dB — a faixa inteira entre silêncio audível e
+             clipping é ~60 dB, então nenhum desses valores é fisicamente real.
+
+          2. O aquecimento conta amostras VÁLIDAS. Com as 5 anteriores, uma
+             única amostra ruim deslocava a média em ~20 dB, o threshold
+             inteiro. Silêncio não adianta esse relógio.
+        """
+        if db <= self.SILENCE_DB:
+            return None
+
+        baseline.append(db)
+
+        if len(baseline) < self.BASELINE_MIN:
+            return None
+
+        baseline_db = sum(baseline) / len(baseline)
+        spike_db    = db - baseline_db
+        if spike_db < self.cfg["threshold_db"]:
+            return None
+
+        return {
+            "db":       round(db, 1),
+            "baseline": round(baseline_db, 1),
+            "spike":    round(spike_db, 1),
+        }
 
     def start(self, stream_file: Path) -> None:
         self._running = True
@@ -249,7 +304,9 @@ class AudioSpikeDetector:
     # ── Loop principal ────────────────────────────────────────────────────────
 
     def _monitor_loop(self, stream_file: Path) -> None:
-        import numpy as np
+        # Valida a dependência AQUI, fora do try do loop: sem isto, um numpy
+        # ausente viraria um logger.debug por chunk, reiniciando para sempre.
+        import numpy as np  # noqa: F401  (usado via _chunk_db)
 
         # Aguarda o arquivo ter dados suficientes
         logger.info("🔊 Aguardando stream acumular dados...")
@@ -350,42 +407,40 @@ class AudioSpikeDetector:
 
                     # ── Análise RMS ───────────────────────────────────────────
                     seek_sec += self.CHUNK_SECS
-                    audio     = np.frombuffer(item, dtype=np.float32)
-                    rms       = float(np.sqrt(np.mean(audio ** 2)))
-                    db        = 20.0 * np.log10(rms + 1e-9)
-                    baseline.append(db)
+                    was_warm  = len(baseline) >= self.BASELINE_MIN
+                    extra     = self._consider_chunk(self._chunk_db(item), baseline)
 
-                    if len(baseline) < 5:
+                    if not was_warm and len(baseline) >= self.BASELINE_MIN:
+                        logger.info(
+                            f"🔊 Baseline de áudio pronto "
+                            f"({len(baseline)} amostras, {sum(baseline)/len(baseline):.1f} dB) "
+                            "— detecção de picos ativa."
+                        )
+
+                    if extra is None:
                         continue
 
-                    baseline_db = sum(baseline) / len(baseline)
-                    spike_db    = db - baseline_db
+                    current_sec = self.elapsed_fn()
+                    if current_sec - last_spike_sec < self.cfg["buffer_before"]:
+                        continue
+                    last_spike_sec = current_sec
 
-                    if spike_db >= self.cfg["threshold_db"]:
-                        current_sec = self.elapsed_fn()
-                        if current_sec - last_spike_sec < self.cfg["buffer_before"]:
-                            continue
-                        last_spike_sec = current_sec
-
-                        m = Moment(
-                            start_sec = max(0.0, current_sec - self.cfg["buffer_before"]),
-                            end_sec   = current_sec + self.cfg["buffer_after"],
-                            reason    = "audio_spike",
-                            score     = min(1.0, spike_db / 40.0),
-                            extra     = {
-                                "db":       round(db, 1),
-                                "baseline": round(baseline_db, 1),
-                                "spike":    round(spike_db, 1),
-                            },
-                        )
-                        with self._lock:
-                            self._moments.append(m)
-                        _metrics_incr("audio.spike_detected")
-                        _metrics_observe("audio.spike_db", round(spike_db, 1))
-                        logger.info(
-                            f"🎯 Pico de áudio em {current_sec:.1f}s "
-                            f"({spike_db:+.1f} dB acima da média)"
-                        )
+                    m = Moment(
+                        start_sec = max(0.0, current_sec - self.cfg["buffer_before"]),
+                        end_sec   = current_sec + self.cfg["buffer_after"],
+                        reason    = "audio_spike",
+                        score     = min(1.0, extra["spike"] / 40.0),
+                        extra     = extra,
+                    )
+                    with self._lock:
+                        self._moments.append(m)
+                    _metrics_incr("audio.spike_detected")
+                    _metrics_observe("audio.spike_db", extra["spike"])
+                    logger.info(
+                        f"🎯 Pico de áudio em {current_sec:.1f}s "
+                        f"({extra['spike']:+.1f} dB acima da média de "
+                        f"{extra['baseline']:.1f} dB)"
+                    )
 
             except Exception as e:
                 logger.debug(f"Audio loop erro: {e}")
