@@ -908,8 +908,10 @@ class VideoEditor:
             if commercial_offset > 0:
                 logger.info(f"\U0001f4fa Comercial: trimando {commercial_offset:.1f}s + reset PTS")
                 trimmed = tmp / "trimmed.ts"
-                # Pre-trim COM reset de PTS (corrige desync)
-                run_ffmpeg([
+                # Pre-trim COM reset de PTS (corrige desync). O resultado conta:
+                # em timeout o run_ffmpeg mata o processo e o .ts PARCIAL fica
+                # com > 1 KB — antes ele virava o clip, truncado e sem erro.
+                r_trim = run_ffmpeg([
                     "ffmpeg", "-y", "-ss", str(commercial_offset),
                     "-i", str(current),
                     "-vf", "setpts=PTS-STARTPTS",
@@ -918,7 +920,7 @@ class VideoEditor:
                     "-c:a", "aac", "-b:a", "192k",
                     str(trimmed),
                 ], label="commercial_pretrim", timeout=60)
-                if trimmed.exists() and trimmed.stat().st_size > 1000:
+                if r_trim.ok and trimmed.exists() and trimmed.stat().st_size > 1000:
                     # Recheck: verificar se ainda tem comercial no trimado
                     recheck = self._detect_commercial_offset(trimmed)
                     if recheck < 0:
@@ -928,7 +930,7 @@ class VideoEditor:
                     elif recheck > 0:
                         logger.info(f"\U0001f4fa Recheck: mais {recheck:.1f}s de comercial")
                         retrimmed = tmp / "retrimmed.ts"
-                        run_ffmpeg([
+                        r_retrim = run_ffmpeg([
                             "ffmpeg", "-y", "-ss", str(recheck),
                             "-i", str(trimmed),
                             "-vf", "setpts=PTS-STARTPTS",
@@ -937,14 +939,18 @@ class VideoEditor:
                             "-c:a", "aac", "-b:a", "192k",
                             str(retrimmed),
                         ], label="commercial_retrim", timeout=60)
-                        if retrimmed.exists() and retrimmed.stat().st_size > 1000:
+                        if (r_retrim.ok and retrimmed.exists()
+                                and retrimmed.stat().st_size > 1000):
                             current = retrimmed
                         else:
                             current = trimmed
                     else:
                         current = trimmed
                 else:
-                    logger.warning("\u26a0\ufe0f Trim de comercial falhou, usando original")
+                    logger.warning(
+                        "\u26a0\ufe0f Trim de comercial falhou "
+                        f"(rc={r_trim.returncode}), usando original"
+                    )
 
             # --- Transcrição / Legendas ---
             segments = []
