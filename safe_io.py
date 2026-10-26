@@ -22,6 +22,7 @@ Usado por credentials.py, pending_store.py e feedback.py.
 
 import logging
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -79,15 +80,30 @@ def atomic_write_text(
     Raises:
         StorageWriteError: se todas as tentativas falharem. O arquivo de
             destino permanece com o conteúdo anterior intacto.
+
+    Cada tentativa usa um temporário PRÓPRIO (mkstemp na mesma pasta, para o
+    rename continuar atômico). Com o nome fixo "<arquivo>.tmp" de antes, dois
+    escritores simultâneos truncavam o tmp um do outro: um rename falhava
+    porque o tmp já tinha sido movido, e o destino podia receber o conteúdo
+    intercalado dos dois — JSON inválido no disco.
     """
     path = Path(path)
-    tmp = path.with_name(path.name + ".tmp")
     last_err: Optional[BaseException] = None
 
     for attempt in range(1, max(1, retries) + 1):
+        tmp: Optional[Path] = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp, "w", encoding=encoding) as f:
+            fd, tmp_name = tempfile.mkstemp(
+                dir=path.parent, prefix=path.name + ".", suffix=".tmp"
+            )
+            tmp = Path(tmp_name)
+            try:
+                f = os.fdopen(fd, "w", encoding=encoding)
+            except Exception:
+                os.close(fd)
+                raise
+            with f:
                 f.write(text)
                 f.flush()
                 try:
@@ -99,17 +115,18 @@ def atomic_write_text(
             return
         except OSError as ex:
             last_err = ex
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
             if attempt < max(1, retries):
                 logger.debug(
                     f"escrita de {path.name} falhou (tentativa {attempt}): {ex}"
                 )
                 time.sleep(backoff * attempt)
 
-    # Esgotou: limpa o lixo e deixa o erro subir (regras 2 e 3)
-    try:
-        tmp.unlink(missing_ok=True)
-    except OSError:
-        pass
+    # Esgotou: o erro sobe (regras 2 e 3). Cada tentativa já limpou o seu tmp.
     raise StorageWriteError(
         f"não foi possível gravar {path} após {max(1, retries)} tentativa(s): {last_err}"
     ) from last_err
