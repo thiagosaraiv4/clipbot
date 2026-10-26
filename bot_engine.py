@@ -580,12 +580,24 @@ class BotEngine:
             if rf:
                 pending_files.add(os.path.normpath(rf))
 
+        # SÓ nomes que o ClipBot cria. clips_folder e output_folder são campos
+        # livres na UI: com "*.mp4"/"*.json", quem apontava a saída para Vídeos
+        # ou para o Desktop perdia todo vídeo e JSON pessoal com mais de 7 dias.
+        #   raw_*.ts   → captura contínua e segmentos (raw_pending_/raw_clip_)
+        #   clip_*.mp4 → clip renderizado;  clip_*.json → sidecar
+        patterns = ("raw_*.ts", "clip_*.mp4", "clip_*.json")
+
         removed = 0
+        seen: set = set()                 # clips_dir == output_dir é comum
         for folder in (clips_dir, output_dir):
             if not folder.exists():
                 continue
-            for pattern in ("raw_*.ts", "*.mp4", "*.json"):
+            for pattern in patterns:
                 for f in folder.glob(pattern):
+                    key = os.path.normcase(os.path.normpath(str(f)))
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     try:
                         age = now - f.stat().st_mtime
                         if age < MAX_AGE_SECS:
