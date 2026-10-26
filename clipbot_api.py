@@ -258,12 +258,19 @@ class ClipBotAPI:
             if reason:
                 problems.append({"what": kind, "error": reason, "writes_blocked": True})
 
-        save_err = None
-        if self._engine is not None:
-            save_err = getattr(self._engine.pending_store, "last_save_error", None)
+        # Sem engine, a store é a do boot (_STORE) — é ali que um pending.json
+        # ilegível aparece primeiro, antes de qualquer START.
+        store = self._engine.pending_store if self._engine is not None else _STORE
+        save_err = getattr(store, "last_save_error", None)
+        load_warn = getattr(store, "load_warning", None)
         if save_err:
+            problems.append({
+                "what": "pending", "error": save_err,
+                "writes_blocked": bool(getattr(store, "writes_suspended", False)),
+            })
+        elif load_warn:
             problems.append(
-                {"what": "pending", "error": save_err, "writes_blocked": False}
+                {"what": "pending", "error": load_warn, "writes_blocked": False}
             )
 
         return {"ok": not problems, "problems": problems}

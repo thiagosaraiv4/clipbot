@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -45,6 +46,15 @@ class PendingStore:
         #: heartbeat para que "momento sumiu" deixe de ser invisível.
         self.last_save_error: Optional[str] = None
         self._save_fail_count: int = 0
+        #: Problema com o pending.json encontrado no boot (ilegível/corrompido).
+        #: Diferente de last_save_error, não some no primeiro save bem-sucedido.
+        self.load_warning: Optional[str] = None
+        # Arquivo do boot existe e não pôde ser lido: gravar o apagaria.
+        self._load_blocked: Optional[str] = None
+        # Instante do boot quando a store NÃO conhece todos os donos de .ts;
+        # None quando conhece. Ver ownership_cutoff.
+        self._boot_time: float = time.time()
+        self._ownership_cutoff: Optional[float] = None
         self._load()
 
     # ── Leitura ───────────────────────────────────────────────────────────────
@@ -67,6 +77,21 @@ class PendingStore:
     def __len__(self) -> int:
         with self._lock:
             return len(self._data)
+
+    @property
+    def ownership_cutoff(self) -> Optional[float]:
+        """
+        Quando o pending.json do boot não pôde ser lido (ou estava corrompido),
+        a store não sabe a quem pertencem os raw_pending_*.ts que já existiam:
+        devolve o instante do boot, e nenhum GC deve apagar .ts mais antigo que
+        isso. None = a store conhece todos os donos.
+        """
+        return self._ownership_cutoff
+
+    @property
+    def writes_suspended(self) -> bool:
+        """True enquanto o pending.json do boot está ilegível (ver _save_locked)."""
+        return self._load_blocked is not None
 
     def set_processing(self, moment_id: str) -> None:
         """Marca um momento como 'em processamento'. Impede deleção do raw_file."""
@@ -209,7 +234,24 @@ class PendingStore:
         pending.json e os logs não permitiam distinguir "a escrita falhou" de
         "a escrita nunca foi tentada". Agora a falha vira ERROR + last_save_error,
         que o engine expõe no heartbeat do canal.
+
+        Escrita suspensa: se o pending.json do boot existia e não pôde ser lido,
+        gravar agora apagaria os pendentes da sessão anterior. Cada save tenta
+        ler de novo (bloqueio de AV costuma ser transitório); se conseguir,
+        mescla as entradas do disco e grava normalmente.
         """
+        if self._load_blocked is not None and not self._try_recover_locked():
+            self.last_save_error = (
+                f"escrita suspensa: {PENDING_FILE.name} da sessão anterior "
+                f"ainda não pode ser lido ({self._load_blocked})"
+            )
+            logger.error(
+                f"❌ pending.json NÃO foi gravado: o arquivo da sessão anterior "
+                f"ainda não pode ser lido ({self._load_blocked}), e gravar agora "
+                f"o apagaria. {len(self._data)} momento(s) existem só em memória."
+            )
+            return
+
         try:
             safe_io.atomic_write_text(
                 PENDING_FILE,
@@ -240,28 +282,44 @@ class PendingStore:
 
         if status != safe_io.OK:
             # Existe e não abriu: NÃO é "primeira execução". Pendentes reais
-            # podem estar nesse arquivo, e sobrescrevê-lo os apagaria.
+            # podem estar nesse arquivo — a escrita fica suspensa até ele voltar
+            # a ser lido, e os GCs poupam os .ts anteriores ao boot.
+            self._load_blocked = err
+            self._ownership_cutoff = self._boot_time
             self.last_save_error = err
+            self.load_warning = f"{PENDING_FILE.name} da sessão anterior ilegível ({err})"
             logger.error(
                 f"❌ {PENDING_FILE.name} existe mas não pôde ser lido ({err}). "
-                "Momentos pendentes da sessão anterior não foram restaurados."
+                "Momentos pendentes da sessão anterior não foram restaurados; "
+                "o arquivo não será sobrescrito até voltar a ser lido."
             )
             return
 
         try:
-            entries = json.loads(raw)
-            if not isinstance(entries, list):
-                raise ValueError(f"esperado lista, veio {type(entries).__name__}")
+            entries = self._parse(raw)
         except Exception as ex:
-            self._quarantine_corrupt(ex)
+            self._handle_corrupt_locked(ex)
             return
 
+        recovered = self._merge_entries(entries)
+        if recovered:
+            logger.info(f"📋 Restaurados {recovered} momento(s) pendente(s) do disco.")
+
+    @staticmethod
+    def _parse(raw: str) -> list:
+        entries = json.loads(raw)
+        if not isinstance(entries, list):
+            raise ValueError(f"esperado lista, veio {type(entries).__name__}")
+        return entries
+
+    def _merge_entries(self, entries: list) -> int:
+        """Incorpora entradas do disco que ainda não estão em memória."""
         recovered = 0
         for e in entries:
             if not isinstance(e, dict):
                 continue
             mid = e.get("moment_id")
-            if not mid:
+            if not mid or mid in self._data:
                 continue
             raw_path = Path(e.get("raw_file", ""))
             if not raw_path.exists():
@@ -274,21 +332,76 @@ class PendingStore:
             e.setdefault("segment_end_sec", e.get("end_sec"))
             self._data[mid] = e
             recovered += 1
-        if recovered:
-            logger.info(f"📋 Restaurados {recovered} momento(s) pendente(s) do disco.")
+        return recovered
 
-    def _quarantine_corrupt(self, ex: Exception) -> None:
+    def _handle_corrupt_locked(self, ex: Exception) -> None:
+        """
+        Conteúdo corrompido: quarentena + proteção dos .ts pelo resto da sessão
+        (as entradas ilegíveis eram a única pista de quem era dono de quê).
+        Se a quarentena falhar, o arquivo segue no caminho e gravar o apagaria.
+        """
+        moved = self._quarantine_corrupt(ex)
+        self._ownership_cutoff = self._boot_time
+        self.load_warning = (
+            f"{PENDING_FILE.name} corrompido ({ex}); "
+            + ("cópia em quarentena" if moved else "quarentena falhou")
+        )
+        if not moved:
+            self._load_blocked = f"corrompido e não pôde ser movido ({ex})"
+
+    def _try_recover_locked(self) -> bool:
+        """
+        Tenta reler o pending.json do boot. True = a escrita pode prosseguir.
+        DEVE ser chamado dentro do lock.
+        """
+        status, raw, err = safe_io.read_text_classified(PENDING_FILE)
+
+        if status == safe_io.UNREADABLE:
+            self._load_blocked = err
+            return False
+
+        if status == safe_io.MISSING:
+            # Sumiu enquanto estava ilegível: não há mais o que proteger nesse
+            # caminho. Os .ts antigos continuam com dono desconhecido.
+            self._load_blocked = None
+            self.load_warning = (
+                f"{PENDING_FILE.name} da sessão anterior desapareceu antes de ser lido"
+            )
+            return True
+
+        try:
+            entries = self._parse(raw)
+        except Exception as ex:
+            self._load_blocked = None
+            self._handle_corrupt_locked(ex)
+            return self._load_blocked is None
+
+        recovered = self._merge_entries(entries)
+        self._load_blocked = None
+        self._ownership_cutoff = None
+        self.load_warning = None
+        logger.info(
+            f"✅ {PENDING_FILE.name} voltou a ser lido: {recovered} momento(s) "
+            "da sessão anterior restaurado(s)."
+        )
+        return True
+
+    def _quarantine_corrupt(self, ex: Exception) -> bool:
         """
         Move um pending.json ilegível para .corrupt.<timestamp> em vez de
         deixá-lo ser sobrescrito pelo próximo save. O arquivo é a única pista
         de quais .ts no disco tinham dono — descartá-lo em silêncio transforma
         um bug diagnosticável em GB de órfãos sem explicação.
+
+        Returns:
+            True se o arquivo saiu do caminho.
         """
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup = PENDING_FILE.with_name(f"{PENDING_FILE.name}.corrupt.{stamp}")
         try:
             os.replace(PENDING_FILE, backup)
-            where = f"cópia preservada em {backup.name}"
+            moved, where = True, f"cópia preservada em {backup.name}"
         except OSError as mv_ex:
-            where = f"cópia NÃO pôde ser preservada ({mv_ex})"
+            moved, where = False, f"cópia NÃO pôde ser preservada ({mv_ex})"
         logger.error(f"❌ {PENDING_FILE.name} corrompido ({ex}). {where}")
+        return moved

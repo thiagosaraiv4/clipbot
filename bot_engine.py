@@ -235,6 +235,12 @@ class BotEngine:
                 f"❌ [storage] pending.json não está sendo gravado ({save_err}). "
                 "Momentos aprovados existem só em memória."
             )
+        load_warn = getattr(self.pending_store, "load_warning", None)
+        if load_warn:
+            logger.warning(
+                f"⚠️  [storage] {load_warn} — .ts da sessão anterior preservados "
+                "até o arquivo voltar a ser lido."
+            )
         try:
             import credentials as _c
             for _kind in ("credentials", "settings"):
@@ -480,15 +486,26 @@ class BotEngine:
             logger.debug(f"gc_orphan: store indisponível ({e})")
             return 0
 
+        # pending.json do boot ilegível/corrompido: a store não sabe quem é
+        # dono dos .ts que já existiam. Apagá-los aqui era a segunda metade da
+        # perda de dados do boot degradado (o arquivo era sobrescrito e os .ts
+        # que ele descrevia iam embora 10 min depois).
+        cutoff = getattr(self.pending_store, "ownership_cutoff", None)
+
         now = time.time()
         removed = 0
+        spared = 0
         freed_mb = 0.0
         for f in clips_dir.glob("raw_pending_*.ts"):
             try:
                 if os.path.normpath(str(f)) in referenced:
                     continue
-                if (now - f.stat().st_mtime) < self._GC_ORPHAN_MIN_AGE_SEC:
+                mtime = f.stat().st_mtime
+                if (now - mtime) < self._GC_ORPHAN_MIN_AGE_SEC:
                     continue          # recém-extraído: pode ainda não estar na store
+                if cutoff is not None and mtime < cutoff:
+                    spared += 1
+                    continue          # anterior ao boot, dono desconhecido
                 size_mb = f.stat().st_size / 1e6
                 f.unlink(missing_ok=True)
                 removed += 1
@@ -502,6 +519,11 @@ class BotEngine:
                 f"({freed_mb:.0f} MB liberados)"
             )
             _metrics_incr("disk.orphan_gc_removed", n=removed)
+        if spared:
+            logger.debug(
+                f"GC órfãos: {spared} .ts anterior(es) ao boot preservado(s) — "
+                "pending.json do boot não foi lido, dono desconhecido"
+            )
         return removed
 
     def _disk_monitor_loop(self, clips_dir: Path) -> None:
@@ -587,6 +609,8 @@ class BotEngine:
         #   clip_*.mp4 → clip renderizado;  clip_*.json → sidecar
         patterns = ("raw_*.ts", "clip_*.mp4", "clip_*.json")
 
+        cutoff = getattr(self.pending_store, "ownership_cutoff", None)
+
         removed = 0
         seen: set = set()                 # clips_dir == output_dir é comum
         for folder in (clips_dir, output_dir):
@@ -599,10 +623,16 @@ class BotEngine:
                         continue
                     seen.add(key)
                     try:
-                        age = now - f.stat().st_mtime
-                        if age < MAX_AGE_SECS:
+                        mtime = f.stat().st_mtime
+                        if now - mtime < MAX_AGE_SECS:
                             continue
                         if os.path.normpath(str(f)) in pending_files:
+                            continue
+                        # Dono desconhecido (pending.json do boot ilegível):
+                        # pendentes anteriores ao boot ficam. A captura contínua
+                        # (raw_{plataforma}_...) nunca é pendente e segue o GC.
+                        if (cutoff is not None and f.name.startswith("raw_pending_")
+                                and mtime < cutoff):
                             continue
                         f.unlink(missing_ok=True)
                         removed += 1
