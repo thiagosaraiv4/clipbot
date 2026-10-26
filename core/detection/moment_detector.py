@@ -1147,6 +1147,10 @@ class MomentDetector:
     # contínuo produzia momentos de 82-340s em produção.
     MAX_MOMENT_DURATION = 60.0
 
+    # Cache de eventos já anunciados no log (ver _announce).
+    _ANNOUNCE_TTL = 600.0   # 2x o TTL de momento dos detectores
+    _ANNOUNCE_MAX = 256
+
     def __init__(self, config: dict, elapsed_fn: Callable[[], float],
                  platform: str = None, channel: str = None):
         """
@@ -1163,6 +1167,7 @@ class MomentDetector:
         self.platform   = platform
         self.channel    = channel
         self._detectors = []
+        self._announced: dict = {}   # chave do evento → timestamp do anúncio
 
         det = config["detection"]
 
@@ -1243,9 +1248,15 @@ class MomentDetector:
                 moments.extend(src.get_moments_snapshot())
 
         moments.sort(key=lambda m: m.start_sec)
-        return self._merge_moments(
+        merged = self._merge_moments(
             moments, max_duration=getattr(self, "_max_duration", None)
         )
+        try:
+            self._announce(merged)
+        except Exception as ex:
+            # Log nunca pode derrubar a detecção.
+            logger.debug(f"anúncio de merge falhou: {ex}")
+        return merged
 
     # ── Algoritmo de merge (sweep-line) ──────────────────────────────────────
 
@@ -1302,7 +1313,10 @@ class MomentDetector:
             return Moment(
                 start_sec=m.start_sec, end_sec=m.start_sec + max_dur,
                 reason=m.reason, score=m.score,
-                keywords=list(m.keywords), extra=dict(m.extra),
+                keywords=list(m.keywords),
+                extra={**m.extra,
+                       "span_sec":    round(m.duration, 1),
+                       "group_start": round(m.start_sec, 1)},
             )
 
         reasons   = {m.reason for m in group}
@@ -1318,12 +1332,8 @@ class MomentDetector:
             if end > g_end:                      # colou no fim do grupo
                 end   = g_end
                 start = max(g_start, end - max_dur)
-            logger.debug(
-                f"✂️  Momento truncado {g_end - g_start:.0f}s → {end - start:.0f}s "
-                f"(teto={max_dur:.0f}s, centrado no pico score={best.score:.2f})"
-            )
 
-        merged = Moment(
+        return Moment(
             start_sec = start,
             end_sec   = end,
             reason    = "super_moment" if len(reasons) > 1 else group[0].reason,
@@ -1333,13 +1343,60 @@ class MomentDetector:
                 "reasons": sorted(reasons),
                 "sources": sorted({m.reason for m in group}),
                 "count":   len(group),
-                "span_sec": round(g_end - g_start, 1),   # duração antes do teto
+                "span_sec":    round(g_end - g_start, 1),  # duração antes do teto
+                "group_start": round(g_start, 1),           # âncora estável do evento
             },
         )
-        if len(reasons) > 1:
-            logger.info(
-                f"⚡ Super moment: {sorted(reasons)}  "
-                f"{merged.start_sec:.1f}s–{merged.end_sec:.1f}s  "
-                f"score={merged.score:.2f}"
-            )
-        return merged
+
+    # ── Anúncio de merges (log) ──────────────────────────────────────────────
+
+    def _announce(self, merged: List[Moment]) -> None:
+        """
+        Loga uma vez por evento distinto.
+
+        Por que isto não mora em _collapse: `all_moments` é recomputada a cada
+        tick do engine (~1/s) enquanto os momentos vivem até 300s nos
+        detectores. Com o log dentro da função pura, o MESMO evento era
+        anunciado ~300 vezes, saturando a fila de log da UI. Recomputar uma
+        visão derivada não é um evento; só a primeira observação é.
+
+        A chave usa `group_start` (não start_sec) porque durante um flood o
+        grupo cresce pelo fim a cada tick — a janela e o moment_id mudam, mas o
+        evento é o mesmo.
+        """
+        now = time.time()
+
+        if len(self._announced) >= self._ANNOUNCE_MAX:
+            fresh = {k: t for k, t in self._announced.items()
+                     if now - t < self._ANNOUNCE_TTL}
+            if len(fresh) >= self._ANNOUNCE_MAX:
+                fresh = dict(sorted(fresh.items(), key=lambda kv: kv[1])
+                             [-(self._ANNOUNCE_MAX // 2):])
+            self._announced = fresh
+
+        for m in merged:
+            extra  = m.extra or {}
+            anchor = extra.get("group_start", round(m.start_sec, 1))
+            span   = extra.get("span_sec")
+
+            if m.reason == "super_moment":
+                key = ("super", anchor, tuple(extra.get("reasons", ())))
+                if key not in self._announced:
+                    self._announced[key] = now
+                    logger.info(
+                        f"⚡ Super moment: {extra.get('reasons', [])}  "
+                        f"{m.start_sec:.1f}s–{m.end_sec:.1f}s  "
+                        f"score={m.score:.2f}"
+                    )
+
+            if span is not None and span > m.duration + 0.5:
+                # Sem o span na chave: ele CRESCE durante um flood, e a
+                # decisão de truncar é a mesma do evento (igual à chave acima).
+                key = ("trunc", anchor)
+                if key not in self._announced:
+                    self._announced[key] = now
+                    logger.debug(
+                        f"✂️  Momento truncado {span:.0f}s → {m.duration:.0f}s "
+                        f"(teto={getattr(self, '_max_duration', None) or self.MAX_MOMENT_DURATION:.0f}s, "
+                        f"centrado no pico)"
+                    )
