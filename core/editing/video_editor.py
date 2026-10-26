@@ -6,6 +6,7 @@ watermark, intro/outro e exporta em formato final.
 
 import logging
 import re
+import shutil
 import tempfile
 import textwrap
 from pathlib import Path
@@ -1073,7 +1074,13 @@ class VideoEditor:
             ]
             mux_args = ["-movflags", "+faststart"]   # TikTok/IG preview-friendly
             cmd_base = list(cmd)   # snapshot p/ retry caso NVENC falhe runtime
-            cmd += video_args + audio_args + mux_args + [str(output_path)]
+            # Render num temporário: em timeout, encoder morrendo ou disco cheio
+            # o ffmpeg deixa um mp4 sem moov, e escrito direto na saída ele
+            # aparecia na aba de clips e podia ir para o upload manual. O
+            # caminho final só passa a existir depois de um render com sucesso
+            # (e o TemporaryDirectory apaga o parcial nos caminhos de erro).
+            render_out = tmp / "render.mp4"
+            cmd += video_args + audio_args + mux_args + [str(render_out)]
 
             encoder_tag = "nvenc" if use_nvenc else "libx264"
             with _Timer("editor.render_final",
@@ -1094,7 +1101,7 @@ class VideoEditor:
                     _metrics_incr("editor.nvenc_runtime_disabled")
                     # Retry com libx264
                     cmd_retry = cmd_base + self._encoder_args(use_nvenc=False) \
-                                + audio_args + mux_args + [str(output_path)]
+                                + audio_args + mux_args + [str(render_out)]
                     with _Timer("editor.render_final",
                                 format=self.cfg.get("output_format", "?"),
                                 encoder="libx264_fallback"):
@@ -1108,6 +1115,9 @@ class VideoEditor:
                 raise RuntimeError(
                     f"ffmpeg render falhou rc={result.returncode}:\n{tail}"
                 )
+
+            # shutil.move: o temporário pode estar em outro disco que a saída.
+            shutil.move(str(render_out), str(output_path))
 
         _metrics_incr("editor.clips_generated", encoder=encoder_tag)
         logger.info(f"✅ Clip editado: {output_path}")
