@@ -105,7 +105,23 @@ Regras:
 - Hashtags em {lang_label} misturado com inglês popular (#fyp, #viral)
 - NÃO invente contexto que não está na transcrição"""
 
-            client = anthropic.Anthropic(timeout=_DESC_TIMEOUT_SEC, max_retries=_DESC_MAX_RETRIES)
+            # Mesma cascata de keys do hook_scorer (ENV → credentials.enc →
+            # settings.json). Sem api_key explícita o SDK só olha o ENV, e a
+            # key salva pela UI nunca chegava aqui: toda legenda de post caía
+            # no _fallback genérico.
+            from hook_scorer import _load_key
+            key = _load_key(
+                "ANTHROPIC_API_KEY",
+                ["anthropic_api_key"],
+                ["system", "anthropic_api_key"],
+            )
+            if not key:
+                logger.debug("sem key da Anthropic — usando fallback")
+                return {}
+
+            client = anthropic.Anthropic(
+                api_key=key, timeout=_DESC_TIMEOUT_SEC, max_retries=_DESC_MAX_RETRIES,
+            )
             msg    = client.messages.create(
                 model="claude-haiku-4-5-20251001",   # rápido e barato
                 max_tokens=400,

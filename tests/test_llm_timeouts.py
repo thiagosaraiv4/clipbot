@@ -82,6 +82,9 @@ def test_gemini_http_options_bound_connect_and_read():
 def anthropic_client(monkeypatch):
     import anthropic
     built = {}
+    # Sem key nenhuma o gerador vai direto ao fallback (B10) e nem cria o
+    # cliente — aqui o que se testa é o cliente, então há uma key no ENV.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-teste")
 
     class FakeAnthropic:
         def __init__(self, **kw):
