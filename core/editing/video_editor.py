@@ -5,6 +5,7 @@ watermark, intro/outro e exporta em formato final.
 """
 
 import logging
+import re
 import tempfile
 import textwrap
 from pathlib import Path
@@ -12,6 +13,27 @@ from typing import Optional
 
 from ffmpeg_runner import run_ffmpeg
 from metrics import Timer as _Timer, incr as _metrics_incr
+
+
+def _blacklist_hits(text: str, blacklist) -> list:
+    """
+    Termos da blacklist presentes no texto como PALAVRA ou FRASE inteira.
+
+    Antes era `kw in texto`, por pedaço: 'pix' casava em "pixel", 'bet' em
+    "diabetes" e "alfabeto", 'stake' em "mistake" — e o clip era descartado
+    (com o .ts apagado). Fronteira de palavra Unicode (acentos contam como
+    letra) e espaços repetidos do Whisper tratados como um só.
+    """
+    norm = re.sub(r"\s+", " ", (text or "").lower())
+    hits = []
+    for kw in blacklist or []:
+        words = (kw or "").lower().split()
+        if not words:
+            continue
+        pattern = r"(?<!\w)" + r"\s+".join(re.escape(w) for w in words) + r"(?!\w)"
+        if re.search(pattern, norm):
+            hits.append(kw)
+    return hits
 
 logger = logging.getLogger("ClipBot.Editor")
 
@@ -935,7 +957,7 @@ class VideoEditor:
                             seg.get("text", "") for seg in segments
                         ).lower()
                         blacklist = cf.get("blacklist_keywords", [])
-                        matched = [kw for kw in blacklist if kw.lower() in full_text]
+                        matched = _blacklist_hits(full_text, blacklist)
                         if matched and cf.get("action", "skip") == "skip":
                             _metrics_incr("editor.skipped", reason="content_filter")
                             logger.warning(
