@@ -115,6 +115,24 @@ def atomic_write_text(
     ) from last_err
 
 
+def quarantine(path) -> Optional[Path]:
+    """
+    Move um arquivo de estado corrompido para <nome>.corrupt.<timestamp>.
+
+    Preserva o conteúdo para diagnóstico e libera o caminho para o app
+    recomeçar dos defaults sem destruir nada. None se não conseguiu mover.
+    """
+    path = Path(path)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    backup = path.with_name(f"{path.name}.corrupt.{stamp}")
+    try:
+        _replace(path, backup)
+        return backup
+    except OSError as ex:
+        logger.debug(f"quarentena de {path.name} falhou: {ex}")
+        return None
+
+
 def check_writable(directory) -> Tuple[bool, Optional[str]]:
     """
     Verifica, de fato escrevendo, se a pasta de estado aceita gravação.

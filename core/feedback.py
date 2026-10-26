@@ -26,6 +26,7 @@ Regra de atualização:
   LR = 0.05, range [0.5, 1.5]
 """
 
+import copy
 import json
 import logging
 
@@ -35,7 +36,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger("ClipBot.Feedback")
 
@@ -68,19 +69,52 @@ _DEFAULT_WEIGHTS: Dict[str, float] = {
 
 
 # ─── Load / Save ─────────────────────────────────────────────────────────────
+#
+# Pesos e histórico são read-modify-write. Uma leitura que falha devolve
+# defaults/{} para o scoring seguir, mas o write que vem depois APAGARIA os
+# dados bons que continuam no disco — o mesmo mecanismo do incidente de 12/08
+# com credentials.enc. Por isso:
+#   • _read_* devolvem (dados, problema DESTA leitura); problema != None
+#     bloqueia a gravação;
+#   • corrompido → quarentena (.corrupt.<ts>) e recomeça dos defaults;
+#   • read-modify-write sob lock, decidido pela leitura feita ali dentro;
+#   • caminho de leitura (scoring, ~1×/s) loga em DEBUG; quem recusa gravar
+#     loga ERROR.
+
+_weights_lock = threading.Lock()
+_history_lock = threading.Lock()
+
+
+def _read_weights() -> Tuple[Dict[str, float], Optional[str]]:
+    """(pesos mesclados com defaults, problema que impede gravar)."""
+    status, raw, err = safe_io.read_text_classified(WEIGHTS_FILE)
+    if status == safe_io.MISSING:
+        return dict(_DEFAULT_WEIGHTS), None
+    if status != safe_io.OK:
+        return dict(_DEFAULT_WEIGHTS), (err or status)
+    try:
+        saved = json.loads(raw)
+        if not isinstance(saved, dict):
+            raise ValueError(f"esperado objeto JSON, veio {type(saved).__name__}")
+        merged = dict(_DEFAULT_WEIGHTS)
+        merged.update({k: float(v) for k, v in saved.items()})
+        return merged, None
+    except Exception as ex:
+        moved = safe_io.quarantine(WEIGHTS_FILE)
+        logger.error(
+            f"❌ {WEIGHTS_FILE.name} corrompido ({ex}); "
+            + (f"cópia em {moved.name}, recomeçando dos pesos padrão."
+               if moved else "quarentena falhou — gravação bloqueada.")
+        )
+        return dict(_DEFAULT_WEIGHTS), (None if moved else f"corrompido: {ex}")
+
 
 def load_weights() -> Dict[str, float]:
     """Carrega pesos do disco. Mescla com defaults para reasons novos."""
-    if not WEIGHTS_FILE.exists():
-        return dict(_DEFAULT_WEIGHTS)
-    try:
-        saved = json.loads(WEIGHTS_FILE.read_text(encoding="utf-8"))
-        merged = dict(_DEFAULT_WEIGHTS)
-        merged.update({k: float(v) for k, v in saved.items()})
-        return merged
-    except Exception as ex:
-        logger.warning(f"feedback_weights.json load falhou: {ex}")
-        return dict(_DEFAULT_WEIGHTS)
+    weights, problem = _read_weights()
+    if problem is not None:
+        logger.debug(f"{WEIGHTS_FILE.name} ilegível ({problem}); usando pesos padrão")
+    return weights
 
 
 def save_weights(weights: Dict[str, float]) -> None:
@@ -215,31 +249,52 @@ _channel_cache_ts: float = 0.0
 _channel_cache_lock = threading.Lock()
 
 
+def _read_channel_history() -> Tuple[dict, Optional[str]]:
+    """(histórico do disco, problema que impede gravar). Sem cache."""
+    status, raw, err = safe_io.read_text_classified(CHANNEL_HISTORY)
+    if status == safe_io.MISSING:
+        return {}, None
+    if status != safe_io.OK:
+        return {}, (err or status)
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError(f"esperado objeto JSON, veio {type(data).__name__}")
+        return data, None
+    except Exception as ex:
+        moved = safe_io.quarantine(CHANNEL_HISTORY)
+        logger.error(
+            f"❌ {CHANNEL_HISTORY.name} corrompido ({ex}); "
+            + (f"cópia em {moved.name}, recomeçando o histórico."
+               if moved else "quarentena falhou — gravação bloqueada.")
+        )
+        return {}, (None if moved else f"corrompido: {ex}")
+
+
 def _load_channel_history() -> dict:
     """
-    Carrega histórico do disco com cache TTL=5s.
+    Carrega histórico do disco com cache TTL=5s (caminho de leitura/scoring).
     Reduz de N reads/s para 1 read/5s em monitor com muitos canais.
+
+    Devolve cópia PROFUNDA: o histórico tem dicts aninhados por canal, e a
+    cópia rasa de antes deixava o caller mutar o próprio cache.
     """
     global _channel_cache, _channel_cache_ts
     now = time.monotonic()
     with _channel_cache_lock:
         if _channel_cache_ts and (now - _channel_cache_ts) < _CHANNEL_HISTORY_TTL_SEC:
-            # Cache válido: cópia rasa para isolamento do caller
-            return dict(_channel_cache)
-    # Cache stale ou vazio: ler disco
-    if not CHANNEL_HISTORY.exists():
-        with _channel_cache_lock:
-            _channel_cache = {}
-            _channel_cache_ts = now
+            return copy.deepcopy(_channel_cache)
+
+    data, problem = _read_channel_history()
+    if problem is not None:
+        # NÃO cacheia a falha: antes o {} ficava 5s no cache e alimentava saves.
+        logger.debug(f"{CHANNEL_HISTORY.name} ilegível ({problem}); histórico vazio nesta leitura")
         return {}
-    try:
-        data = json.loads(CHANNEL_HISTORY.read_text(encoding="utf-8"))
-    except Exception:
-        data = {}
+
     with _channel_cache_lock:
         _channel_cache = data
         _channel_cache_ts = now
-        return dict(data)
+        return copy.deepcopy(data)
 
 
 def _save_channel_history(history: dict) -> None:
@@ -251,15 +306,31 @@ def _save_channel_history(history: dict) -> None:
         )
         # Atualiza cache em vez de invalidar — evita roundtrip desnecessário
         with _channel_cache_lock:
-            _channel_cache = dict(history)
+            _channel_cache = copy.deepcopy(history)
             _channel_cache_ts = time.monotonic()
     except OSError as ex:
         logger.warning(f"⚠️  {CHANNEL_HISTORY.name} não foi gravado: {ex}")
 
 
 def update_channel_history(channel: str, reason: str, score: float) -> None:
-    """Registra um clip gerado no histórico do canal."""
-    history = _load_channel_history()
+    """
+    Registra um clip gerado no histórico do canal.
+
+    Read-modify-write sob lock, a partir do DISCO (não do cache: um leitor
+    concorrente pode ter reposto no cache uma versão anterior ao último save).
+    """
+    with _history_lock:
+        _update_channel_history_locked(channel, reason, score)
+
+
+def _update_channel_history_locked(channel: str, reason: str, score: float) -> None:
+    history, problem = _read_channel_history()
+    if problem is not None:
+        logger.error(
+            f"❌ Histórico de [{channel}] NÃO atualizado: {CHANNEL_HISTORY.name} "
+            f"ilegível ({problem}). Gravar agora apagaria o histórico dos outros canais."
+        )
+        return
 
     if channel not in history:
         history[channel] = {
@@ -320,37 +391,54 @@ def apply_feedback(
     Retorna os pesos atualizados.
 
     Fórmula: w += LR * (target - base_score), clamp [W_MIN, W_MAX]
+
+    Com weights=None (o caminho de produção), lê, ajusta e grava sob lock,
+    decidido pela leitura feita ali dentro. Se o arquivo de pesos estiver
+    ilegível, NADA é gravado por cima — gravar defaults+1 ajuste apagaria os
+    pesos aprendidos. O clique continua registrado em feedback.jsonl (sem
+    pesos), para poder ser reaplicado depois.
     """
-    if weights is None:
-        weights = load_weights()
-
     target = _LABEL_TARGET.get(label, 0.5)
-    w      = float(weights.get(reason, 1.0))
-    w_new  = w + LR * (target - base_score)
-    w_new  = round(max(W_MIN, min(W_MAX, w_new)), 4)
 
-    weights[reason] = w_new
-    save_weights(weights)
+    with _weights_lock:
+        problem = None
+        if weights is None:
+            weights, problem = _read_weights()
 
-    # ── Log imutável ──────────────────────────────────────────────────────────
-    try:
-        APP_DATA.mkdir(parents=True, exist_ok=True)
-        line = json.dumps({
-            "ts":         datetime.now().isoformat(),
-            "reason":     reason,
-            "label":      label,
-            "base_score": round(base_score, 4),
-            "old_weight": round(w, 4),
-            "new_weight": w_new,
-        }, ensure_ascii=False)
-        with open(FEEDBACK_LOG, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception as ex:
-        logger.warning(f"feedback.jsonl append falhou: {ex}")
+        w      = float(weights.get(reason, 1.0))
+        w_new  = w + LR * (target - base_score)
+        w_new  = round(max(W_MIN, min(W_MAX, w_new)), 4)
 
-    logger.info(
-        f"🧠 Feedback [{label}] reason={reason}  "
-        f"w: {w:.3f} → {w_new:.3f}  (target={target}, base={base_score:.2f})"
-    )
+        if problem is None:
+            weights[reason] = w_new
+            save_weights(weights)
+        else:
+            logger.error(
+                f"❌ Feedback [{label}] {reason} NÃO aplicado aos pesos: "
+                f"{WEIGHTS_FILE.name} ilegível ({problem}). Registrado em "
+                f"{FEEDBACK_LOG.name} para reaplicar depois."
+            )
+
+        # ── Log imutável (sob o mesmo lock: append concorrente intercala) ──
+        try:
+            APP_DATA.mkdir(parents=True, exist_ok=True)
+            line = json.dumps({
+                "ts":         datetime.now().isoformat(),
+                "reason":     reason,
+                "label":      label,
+                "base_score": round(base_score, 4),
+                "old_weight": round(w, 4) if problem is None else None,
+                "new_weight": w_new if problem is None else None,
+            }, ensure_ascii=False)
+            with open(FEEDBACK_LOG, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as ex:
+            logger.warning(f"feedback.jsonl append falhou: {ex}")
+
+    if problem is None:
+        logger.info(
+            f"🧠 Feedback [{label}] reason={reason}  "
+            f"w: {w:.3f} → {w_new:.3f}  (target={target}, base={base_score:.2f})"
+        )
     return weights
 
