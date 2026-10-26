@@ -1213,8 +1213,18 @@ class BotEngine:
                                 "youtube":   config["upload"]["youtube"]["enabled"],
                             }
 
+                            from uploader import DailyPublishLimit, publish_with_limit
+                            limits = DailyPublishLimit(config["upload"].get("max_clips_per_day"))
                             for upload_plat, enabled in active_upload.items():
                                 if not enabled:
+                                    continue
+                                # Teto diário ANTES da descrição: não gasta LLM
+                                # com post que não vai sair (B2).
+                                if not limits.has_room(upload_plat):
+                                    logger.warning(
+                                        f"⏸ [{label}] {upload_plat}: limite diário atingido, post pulado"
+                                    )
+                                    all_results[upload_plat] = False
                                     continue
                                 try:
                                     desc    = desc_gen.generate(
@@ -1226,15 +1236,18 @@ class BotEngine:
                                     tags    = desc["hashtags"]
                                     logger.info(f"📝 [{upload_plat}] {title}")
 
+                                    post = None
                                     if upload_plat == "tiktok" and uploader.tiktok:
-                                        all_results["tiktok"] = uploader.tiktok.upload(
-                                            edited, caption, tags)
+                                        post = lambda: uploader.tiktok.upload(edited, caption, tags)
                                     elif upload_plat == "instagram" and uploader.instagram:
-                                        all_results["instagram"] = uploader.instagram.upload(
-                                            edited, caption)
+                                        post = lambda: uploader.instagram.upload(edited, caption)
                                     elif upload_plat == "youtube" and uploader.youtube:
-                                        all_results["youtube"] = uploader.youtube.upload(
-                                            edited, title, caption)
+                                        post = lambda: uploader.youtube.upload(edited, title, caption)
+                                    if post is not None:
+                                        res = publish_with_limit(limits, upload_plat, post)
+                                        all_results[upload_plat] = bool(res)
+                                        if res is None:
+                                            continue
 
                                     _metrics_incr(
                                         "engine.upload_attempt",

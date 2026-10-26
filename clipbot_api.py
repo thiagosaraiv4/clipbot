@@ -579,19 +579,32 @@ class ClipBotAPI:
         # _build_config é @staticmethod — chama direto na classe, sem instanciar BotEngine
         config = BotEngine._build_config(settings, credentials)
 
+        # O mesmo teto diário do modo automático (antes o upload manual não
+        # consultava limite nenhum).
+        import uploader as _up
+        limits = _up.DailyPublishLimit(config["upload"].get("max_clips_per_day"))
+        makers = {
+            "tiktok":    lambda: _up.TikTokUploader(config).upload(video),
+            "youtube":   lambda: _up.YouTubeUploader(config).upload(video),
+            "instagram": lambda: _up.InstagramUploader(config).upload(video),
+        }
+
         for plat in platforms:
             self._on_log("INFO", f"📤 Upload manual → {plat}: {video.name}")
             try:
                 ok = False
-                if plat == "tiktok":
-                    from uploader import TikTokUploader  # type: ignore
-                    ok = TikTokUploader(config).upload(video)
-                elif plat == "youtube":
-                    from uploader import YouTubeUploader  # type: ignore
-                    ok = YouTubeUploader(config).upload(video)
-                elif plat == "instagram":
-                    from uploader import InstagramUploader  # type: ignore
-                    ok = InstagramUploader(config).upload(video)
+                if plat in makers:
+                    res = _up.publish_with_limit(limits, plat, makers[plat])
+                    if res is None:
+                        self._on_log(
+                            "WARNING",
+                            f"⏸ {plat}: limite diário de "
+                            f"{limits.limit_for(plat)} post(s) atingido — upload não feito "
+                            "(ajuste em Max clips/dia)",
+                        )
+                        self._js(f"onUploadResult({json.dumps({'platform': plat, 'ok': False, 'clip': video.name, 'reason': 'daily_limit'})})")
+                        continue
+                    ok = res
 
                 icon = "✅" if ok else "❌"
                 self._on_log(

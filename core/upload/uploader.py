@@ -10,14 +10,17 @@ Mudanças v2.4 (teardown Playwright):
     de segurança para crashes antes do finally.
 """
 
+import json
 import logging
 import os
 import time
 import atexit
 import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
+
+import safe_io
 
 logger = logging.getLogger("ClipBot.Upload")
 
@@ -546,6 +549,130 @@ class YouTubeUploader:
 # Coordenador de uploads
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Teto diário de posts
+# ──────────────────────────────────────────────────────────────────────────────
+
+_publish_lock = threading.Lock()
+
+
+class DailyPublishLimit:
+    """
+    Teto diário de posts POR plataforma, persistido em disco.
+
+    O "Max clips/dia" da UI só era lido por upload_all, que nada em produção
+    chamava: o modo automático e o upload manual postavam sem limite, e o
+    contador vivia só em memória. Postar o volume que a live gera é o padrão
+    repetitivo que as regras antispam punem.
+
+      • limite = valor da UI, nunca acima do teto duro da plataforma;
+      • contagem em APPDATA/ClipBot/publish_counts.json, zerada a cada dia;
+      • sem conseguir ler o contador, não posta (poderia passar do teto).
+    """
+
+    # Tetos por conta a cada 24 h: TikTok ~15 (Content Posting API, todos os
+    # apps somados), Instagram 50 (content_publishing_limit), Facebook 30
+    # (Reels API), YouTube 100 (cota de uploads do projeto).
+    HARD_CAPS = {"tiktok": 15, "instagram": 50, "facebook": 30, "youtube": 100}
+
+    def __init__(self, max_per_day=None, today=None):
+        self.max_per_day = int(max_per_day) if max_per_day else None
+        self._today = today or date.today
+
+    @staticmethod
+    def _path() -> Path:
+        return _clipbot_appdata() / "publish_counts.json"
+
+    def limit_for(self, platform: str) -> int:
+        cap = self.HARD_CAPS.get(platform)
+        if self.max_per_day is None:
+            return cap if cap is not None else 10 ** 6
+        return min(self.max_per_day, cap) if cap is not None else self.max_per_day
+
+    def _read(self):
+        """(contagem de hoje, leitura_ok)."""
+        status, raw, err = safe_io.read_text_classified(self._path())
+        if status == safe_io.MISSING:
+            return {}, True
+        if status != safe_io.OK:
+            logger.error(
+                f"❌ Contador de posts ilegível ({err}); post recusado para não "
+                "passar do limite diário"
+            )
+            return {}, False
+        try:
+            data = json.loads(raw)
+            if data.get("date") != self._today().isoformat():
+                return {}, True
+            return {k: int(v) for k, v in (data.get("counts") or {}).items()}, True
+        except Exception as e:
+            safe_io.quarantine(self._path())
+            logger.warning(f"⚠️  Contador de posts corrompido ({e}); recomeçando o dia do zero")
+            return {}, True
+
+    def _write(self, counts: dict) -> None:
+        safe_io.atomic_write_text(
+            self._path(),
+            json.dumps({"date": self._today().isoformat(), "counts": counts}, indent=2),
+        )
+
+    def has_room(self, platform: str) -> bool:
+        """Checagem sem reservar (para não gastar LLM com post que não vai sair)."""
+        with _publish_lock:
+            counts, ok = self._read()
+            return ok and counts.get(platform, 0) < self.limit_for(platform)
+
+    def try_reserve(self, platform: str) -> bool:
+        with _publish_lock:
+            counts, ok = self._read()
+            if not ok:
+                return False
+            limit = self.limit_for(platform)
+            if counts.get(platform, 0) >= limit:
+                logger.warning(f"⏸ {platform}: limite diário de {limit} post(s) atingido")
+                return False
+            counts[platform] = counts.get(platform, 0) + 1
+            try:
+                self._write(counts)
+            except OSError as e:
+                logger.error(f"❌ Contador de posts não gravado ({e}); post recusado")
+                return False
+            return True
+
+    def release(self, platform: str) -> None:
+        """Devolve uma vaga (o post reservado falhou)."""
+        with _publish_lock:
+            counts, ok = self._read()
+            if not ok or counts.get(platform, 0) <= 0:
+                return
+            counts[platform] -= 1
+            try:
+                self._write(counts)
+            except OSError as e:
+                logger.warning(f"⚠️  Não foi possível devolver a vaga de {platform}: {e}")
+
+
+def publish_with_limit(limits: DailyPublishLimit, platform: str, upload_fn):
+    """
+    Posta respeitando o teto diário. Ponto único usado pelo modo automático,
+    pelo upload manual e por upload_all.
+
+    Returns:
+        None se o limite recusou; senão o resultado do upload (bool). Falha
+        ou exceção devolvem a vaga — só post bem-sucedido conta.
+    """
+    if not limits.try_reserve(platform):
+        return None
+    try:
+        ok = bool(upload_fn())
+    except Exception:
+        limits.release(platform)
+        raise
+    if not ok:
+        limits.release(platform)
+    return ok
+
+
 class MultiPlatformUploader:
 
     def __init__(self, config: dict):
@@ -556,21 +683,11 @@ class MultiPlatformUploader:
         self.instagram = InstagramUploader(config) if self.up_cfg["instagram"]["enabled"] else None
         self.youtube   = YouTubeUploader(config)   if self.up_cfg["youtube"]["enabled"]   else None
 
-        self._daily_counts = {"tiktok": 0, "instagram": 0, "youtube": 0}
-        self._last_date    = datetime.now().date()
-
-    def _reset_daily_counts(self) -> None:
-        today = datetime.now().date()
-        if today != self._last_date:
-            self._daily_counts = {k: 0 for k in self._daily_counts}
-            self._last_date    = today
-
     def upload_all(self, video_path: Path, title: str = None,
                    description: str = None, tags: list = None) -> dict:
-        self._reset_daily_counts()
-        max_per_day = self.up_cfg["max_clips_per_day"]
-        delay       = self.up_cfg["delay_between_posts"]
-        results     = {}
+        limits  = DailyPublishLimit(self.up_cfg.get("max_clips_per_day"))
+        delay   = self.up_cfg["delay_between_posts"]
+        results = {}
 
         platforms = [
             ("tiktok",    self.tiktok,    lambda: self.tiktok.upload(video_path, title, tags)),
@@ -581,14 +698,11 @@ class MultiPlatformUploader:
         for name, upl, fn in platforms:
             if upl is None:
                 continue
-            if self._daily_counts[name] >= max_per_day:
-                logger.warning(f"⚠️  {name}: limite diário ({max_per_day}) atingido.")
+            success = publish_with_limit(limits, name, fn)
+            if success is None:
                 results[name] = False
                 continue
-            success = fn()
             results[name] = success
-            if success:
-                self._daily_counts[name] += 1
             if delay > 0:
                 logger.info(f"⏳ Aguardando {delay}s...")
                 time.sleep(delay)
