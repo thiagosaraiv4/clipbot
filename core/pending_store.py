@@ -98,6 +98,21 @@ class PendingStore:
         with self._lock:
             self._processing.add(moment_id)
 
+    def try_set_processing(self, moment_id: str) -> bool:
+        """
+        Marca como 'em processamento' só se ainda não estiver. False = já há
+        uma geração em curso deste momento.
+
+        set_processing sozinho não checava: um duplo clique (ou o card
+        recriado ao voltar à aba) gerava o mesmo momento duas vezes, e a
+        primeira a terminar apagava o .ts que a segunda ainda usava.
+        """
+        with self._lock:
+            if moment_id in self._processing:
+                return False
+            self._processing.add(moment_id)
+            return True
+
     def clear_processing(self, moment_id: str) -> None:
         """Remove a marca de processamento."""
         with self._lock:

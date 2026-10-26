@@ -1024,7 +1024,10 @@ class BotEngine:
                             )
                             try:
                                 ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                raw_name = f"pending_{platform}_{clean}_{ts}_{m.reason}"
+                                # moment_id no nome: vários grupos fechados podem
+                                # sair no mesmo tick, e o mesmo segundo + reason
+                                # fazia a 2ª extração sobrescrever o .ts da 1ª.
+                                raw_name = f"pending_{platform}_{clean}_{ts}_{m.moment_id[:8]}_{m.reason}"
                                 raw_clip = clips_dir / f"raw_{raw_name}.ts"
 
                                 min_dur = config["detection"]["audio_spike"]["min_clip_duration"]
@@ -1087,7 +1090,7 @@ class BotEngine:
                                 continue
 
                             ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            name     = f"clip_{platform}_{clean}_{ts}_{m.reason}"
+                            name     = f"clip_{platform}_{clean}_{ts}_{m.moment_id[:8]}_{m.reason}"
                             raw_clip = clips_dir / f"raw_{name}.ts"
 
                             min_dur = config["detection"]["audio_spike"]["min_clip_duration"]
@@ -1421,8 +1424,14 @@ class BotEngine:
         if config is None or editor is None:
             return {"ok": False, "error": "Engine não está rodando — inicie o engine primeiro"}
 
-        # Marca como "processing" para impedir reject concorrente de deletar o raw_file
-        self.pending_store.set_processing(moment_id)
+        # Marca como "processing" para impedir reject concorrente de deletar o
+        # raw_file — e recusa uma segunda geração do mesmo momento em curso.
+        if not self.pending_store.try_set_processing(moment_id):
+            return {
+                "ok": False,
+                "reason": "already_processing",
+                "error": "Este momento já está sendo gerado",
+            }
         try:
             from feedback import load_weights, score_moment_advanced, update_channel_history
             weights     = load_weights()
@@ -1434,9 +1443,12 @@ class BotEngine:
             )
 
             ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # moment_id no nome: o timestamp é em segundos, e dois momentos do
+            # mesmo canal e reason gerados no mesmo segundo escreviam no MESMO
+            # .mp4/.json. O reason continua por último (get_clips o lê ali).
             name        = (
                 f"clip_{entry['platform']}_{entry['channel']}"
-                f"_{ts}_{entry['reason']}"
+                f"_{ts}_{moment_id[:8]}_{entry['reason']}"
             )
 
             output_dir = Path(config["system"]["output_folder"])
