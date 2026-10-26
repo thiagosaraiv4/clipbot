@@ -21,7 +21,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from credentials import load_settings, save_settings, load_credentials, save_credentials
+from credentials import (load_settings, save_settings, read_settings,
+                         load_credentials, save_credentials,
+                         update_credentials, StorageDegraded)
 from bot_engine import BotEngine
 
 # ── Pending store compartilhado entre sessões do engine ──────────────────────
@@ -125,6 +127,9 @@ class ClipBotAPI:
         self._window   = None
         self._engine: Optional[BotEngine] = None
         self._poll_timer: Optional[threading.Timer] = None
+        # Motivo, se a config entregue à UI veio dos defaults por falha de
+        # leitura. Ver config_for_ui / save_config.
+        self._ui_config_problem: Optional[str] = None
 
     # ─── Janela ───────────────────────────────────────────────────────────────
 
@@ -141,10 +146,35 @@ class ClipBotAPI:
 
     # ─── Config ───────────────────────────────────────────────────────────────
 
+    def config_for_ui(self) -> dict:
+        """
+        Config que a UI vai exibir — e devolver inteira no "Salvar".
+
+        Registra se ESTA leitura falhou. A UI recebe a config uma vez
+        (app.on_loaded) e manda o objeto completo de volta; se ele veio dos
+        defaults, gravá-lo trocaria canais e tokens reais por uma config vazia.
+        Leituras posteriores de outras threads (get_clips, start_engine,
+        hook_scorer) não dizem nada sobre essa cópia, então não mudam a decisão.
+        """
+        cfg, problem = read_settings()
+        self._ui_config_problem = problem
+        return cfg
+
     def get_config(self) -> dict:
-        return load_settings()
+        return self.config_for_ui()
 
     def save_config(self, config: dict) -> dict:
+        if self._ui_config_problem:
+            return {
+                "ok": False,
+                "reason": "storage_degraded",
+                "error": (
+                    "As configurações na tela são os valores padrão: o "
+                    f"settings.json não pôde ser lido ({self._ui_config_problem}). "
+                    "Salvar agora trocaria seus canais e tokens pelos padrões. "
+                    "Libere o arquivo (antivírus/permissões) e reinicie o ClipBot."
+                ),
+            }
         try:
             save_settings(config)
             return {"ok": True}
@@ -184,33 +214,23 @@ class ClipBotAPI:
         """
         try:
             allowed = {"anthropic_api_key", "openai_api_key", "google_api_key"}
-            creds = load_credentials() or {}
-            # `creds` vazio pode significar "nada salvo ainda" OU "falhei ao
-            # ler". No segundo caso, gravar apagaria as outras credenciais
-            # (tiktok/instagram/youtube) que continuam no disco. save_credentials
-            # recusaria, mas aqui o erro fica legível para a UI.
-            import credentials as _c
-            if _c.storage_degraded("credentials"):
-                return {
-                    "ok": False,
-                    "reason": "storage_degraded",
-                    "error": (
-                        "Não foi possível ler credentials.enc "
-                        f"({_c.degraded_reason('credentials')}). Salvar agora "
-                        "apagaria suas outras credenciais. Verifique o "
-                        "antivírus/permissões da pasta e reinicie o ClipBot."
-                    ),
-                }
-            updated = []
+            updates = {}
             for k, v in (keys or {}).items():
                 if k not in allowed:
                     continue
                 v = (v or "").strip()
-                if not v:
-                    continue
-                creds[k] = v
-                updated.append(k)
-            save_credentials(creds)
+                if v:
+                    updates[k] = v
+            updated = sorted(updates)
+            # Read-modify-write atômico: a decisão vem da leitura feita sob
+            # lock. O padrão antigo (load → check do flag global → save) tinha
+            # janela em que outra thread marcava "saudável" e o {} de uma
+            # leitura falha ia ao disco, apagando tiktok/instagram/youtube.
+            try:
+                if updates:
+                    update_credentials(updates)
+            except StorageDegraded as e:
+                return {"ok": False, "reason": "storage_degraded", "error": str(e)}
 
             # Invalida cache pra próximo score() reconhecer as keys novas
             try:
@@ -253,10 +273,14 @@ class ClipBotAPI:
         """Estado consolidado do armazenamento, para a UI avisar o usuário."""
         import credentials as _c
         problems = []
-        for kind in ("credentials", "settings"):
-            reason = _c.degraded_reason(kind)
-            if reason:
-                problems.append({"what": kind, "error": reason, "writes_blocked": True})
+        reason = _c.degraded_reason("credentials")
+        if reason:
+            problems.append({"what": "credentials", "error": reason, "writes_blocked": True})
+        # settings: o que bloqueia o Salvar é a cópia da UI, não a última
+        # leitura de qualquer thread.
+        if self._ui_config_problem:
+            problems.append({"what": "settings", "error": self._ui_config_problem,
+                             "writes_blocked": True})
 
         # Sem engine, a store é a do boot (_STORE) — é ali que um pending.json
         # ilegível aparece primeiro, antes de qualquer START.

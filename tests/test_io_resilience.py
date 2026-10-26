@@ -227,18 +227,11 @@ def test_unreadable_settings_marks_degraded_but_app_still_boots(creds_mod, monke
     assert creds_mod.storage_degraded("settings") is True
 
 
-def test_save_settings_refuses_while_degraded(creds_mod, monkeypatch):
-    """Impede que a UI sobrescreva a config real com os defaults."""
-    real = {"platforms": {"twitch": {"enabled": True, "channels": ["baiano", "kosky"]}}}
-    creds_mod.save_settings(real)
-
-    heal = _break_reads(monkeypatch)
-    creds_mod.load_settings()                         # degrada
-    with pytest.raises(creds_mod.StorageDegraded):
-        creds_mod.save_settings({"platforms": {}})
-
-    heal()
-    assert creds_mod.load_settings() == real
+# test_save_settings_refuses_while_degraded saiu daqui (Lote 1 / A3).
+# Ele fixava o guard no estado GLOBAL da última leitura, que é o defeito: uma
+# leitura de outra thread liberava o save de uma UI com defaults (ou travava o
+# de uma UI com a config real). O contrato agora é da cópia da UI e está em
+# tests/test_settings_provenance.py.
 
 
 def test_good_read_clears_degraded_state(creds_mod, monkeypatch):

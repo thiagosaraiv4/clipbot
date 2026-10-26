@@ -111,9 +111,10 @@ def main():
     def on_loaded():
         """Chamado quando o HTML terminou de carregar."""
         import json
-        from credentials import load_settings
         api._set_window(window)
-        cfg = load_settings()
+        # config_for_ui registra se esta leitura falhou: é essa cópia que a UI
+        # devolve inteira no "Salvar" (ver ClipBotAPI.save_config).
+        cfg = api.config_for_ui()
         # Injeta config inicial no JS sem precisar de fetch
         window.evaluate_js(f"window._initConfig({json.dumps(cfg)})")
 
