@@ -12,6 +12,12 @@ from typing import Optional
 
 logger = logging.getLogger("ClipBot.Description")
 
+# Teto da chamada de descrição. O padrão do SDK é read de 600 s com 2
+# retentativas — até ~30 min travando quem chamou (thread do canal no modo
+# automático). Com max_retries=1, o pior caso fica em 2 × 15 s.
+_DESC_TIMEOUT_SEC = 15.0
+_DESC_MAX_RETRIES = 1
+
 
 # ------------------------------------------------------------------
 # Gerador principal
@@ -99,7 +105,7 @@ Regras:
 - Hashtags em {lang_label} misturado com inglês popular (#fyp, #viral)
 - NÃO invente contexto que não está na transcrição"""
 
-            client = anthropic.Anthropic()
+            client = anthropic.Anthropic(timeout=_DESC_TIMEOUT_SEC, max_retries=_DESC_MAX_RETRIES)
             msg    = client.messages.create(
                 model="claude-haiku-4-5-20251001",   # rápido e barato
                 max_tokens=400,

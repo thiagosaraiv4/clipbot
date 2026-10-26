@@ -298,7 +298,7 @@ class _GeminiProvider(_BaseProvider):
                     ["google_api_key", "gemini_api_key"],
                     ["system", "google_api_key"],
                 )
-                cls._client = genai.Client(api_key=key)
+                cls._client = genai.Client(api_key=key, http_options=_gemini_http_options())
             from google.genai import types as genai_types
             resp = cls._client.models.generate_content(
                 model=_GEMINI_MODEL,
@@ -312,6 +312,19 @@ class _GeminiProvider(_BaseProvider):
         except Exception as e:
             logger.debug(f"gemini: {type(e).__name__}: {e}")
             return None
+
+
+def _gemini_http_options():
+    """
+    Timeout do cliente Gemini, igual ao dos outros providers.
+
+    No google-genai, sem http_options o SDK passa timeout=None ao httpx: nem
+    connect nem read têm limite, e uma conexão que cai sem RST bloqueia o recv
+    para sempre (canal parado no modo automático; "Gerar" eterno no modo
+    aprovação). Atenção à unidade: aqui o timeout é em MILISSEGUNDOS.
+    """
+    from google.genai import types as genai_types
+    return genai_types.HttpOptions(timeout=int(_TIMEOUT_SEC * 1000))
 
 
 _PROVIDERS = {
