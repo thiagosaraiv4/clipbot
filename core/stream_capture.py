@@ -17,6 +17,7 @@ import subprocess
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from ffmpeg_runner import FFmpegSession, run_ffmpeg, kill_tree
 
@@ -65,6 +66,23 @@ def _cleanup_all_captures() -> None:
 
 
 atexit.register(_cleanup_all_captures)
+
+
+def _probe_duration(path) -> Optional[float]:
+    """Duração do arquivo em segundos via ffprobe; None se não deu para medir."""
+    try:
+        r = run_ffmpeg(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            label="probe_segment", timeout=15, capture_stdout=True, quiet=True,
+        )
+        if not r.ok:
+            return None
+        txt = (r.stdout or b"").decode("utf-8", "replace").strip()
+        return float(txt) if txt and txt != "N/A" else None
+    except Exception as e:
+        logger.debug(f"ffprobe falhou: {e}")
+        return None
 
 
 class StreamCapture:
@@ -362,5 +380,42 @@ class StreamCapture:
             raise RuntimeError(
                 f"ffmpeg recorte falhou rc={result.returncode}:\n{tail}"
             )
+        self._validate_segment(Path(output_path), duration)
         logger.info(f"✂️  Segmento salvo: {output_path}")
         return output_path
+
+    # Recorte mínimo aceitável. Com -ss além do fim do arquivo o ffmpeg sai
+    # com rc=0 e grava um .ts só com o cabeçalho (~3 KB, 0,02 s): a live caiu,
+    # o chat continuou gerando momentos, e o lixo ia para a fila de aprovação.
+    _MIN_SEGMENT_SEC   = 1.0
+    _MIN_SEGMENT_RATIO = 0.5
+    _MIN_SEGMENT_BYTES = 64 * 1024     # piso sem ffprobe: cabeçalho de .ts ~3 KB
+
+    def _validate_segment(self, path: Path, requested_sec: float) -> None:
+        """
+        Confere a duração real do recorte. Remove o arquivo e levanta
+        RuntimeError se ele não serve; recorte parcial passa com aviso.
+        """
+        got = _probe_duration(path)
+        if got is None:
+            size = path.stat().st_size if path.exists() else 0
+            if size < self._MIN_SEGMENT_BYTES:
+                path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"recorte vazio: {path.name} tem {size} bytes "
+                    "(sem ffprobe para medir a duração)"
+                )
+            return
+
+        need = max(self._MIN_SEGMENT_SEC, self._MIN_SEGMENT_RATIO * requested_sec)
+        if got < need:
+            path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"recorte curto demais: {got:.1f}s de {requested_sec:.1f}s pedidos "
+                "— a janela passou do fim do material capturado"
+            )
+        if got < 0.95 * requested_sec:
+            logger.warning(
+                f"⚠️  Recorte parcial: {got:.1f}s de {requested_sec:.1f}s pedidos "
+                f"({path.name})"
+            )
