@@ -9,11 +9,24 @@ import re
 import shutil
 import tempfile
 import textwrap
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
 from ffmpeg_runner import run_ffmpeg
 from metrics import Timer as _Timer, incr as _metrics_incr
+
+
+# Caracteres que a fonte do banner (Impact) não desenha: o drawtext não tem
+# fallback de fonte e mostra uma caixa vazia ("CAIU DA CADEIRA □").
+_INVISIBLE_JOINERS = {"\u200d", "\ufe0e", "\ufe0f", "\u20e3"}
+
+
+def _undrawable(c: str) -> bool:
+    """Emoji, pictogramas e seus modificadores invisíveis."""
+    if c in _INVISIBLE_JOINERS or ord(c) > 0xFFFF:
+        return True
+    return unicodedata.category(c) in ("So", "Cs", "Co", "Cn")
 
 
 def _blacklist_hits(text: str, blacklist) -> list:
@@ -536,6 +549,9 @@ class VideoEditor:
         Solução: substituir ' por aspas tipográficas Unicode U+2019 (')
         antes de qualquer escape. Visualmente idêntico, drawtext-safe.
         """
+        # Emoji e pictogramas saem: viram caixa vazia na fonte do banner.
+        text = "".join(c for c in text if not _undrawable(c))
+        text = re.sub(r"[ \t]+", " ", text).strip()
         # Substituir aspas simples por aspas tipográficas Unicode ANTES de escapar
         text = text.replace("'", "’")
         # Aspas duplas idem (paranoia + estilo)
@@ -543,7 +559,10 @@ class VideoEditor:
         # Ordem importa: \ primeiro
         text = text.replace("\\", "\\\\")
         text = text.replace(":", "\\:")
-        text = text.replace("%", "\\%")
+        # "%" NÃO é escapado aqui: os drawtext do banner usam expansion=none,
+        # que deixa o texto literal. O antigo "\\%" era consumido pelas duas
+        # camadas de escape do filter_complex; o "%" cru chegava à expansão do
+        # drawtext ("Stray %"), e o banner saía VAZIO com rc=0.
         text = text.replace("\n", "\\n")
         return text
 
@@ -682,7 +701,7 @@ class VideoEditor:
             ]
             # Drawtext linha 1
             dt1 = (
-                f"[__blob_bg]drawtext={font_arg}:text='{lines[0]}'"
+                f"[__blob_bg]drawtext={font_arg}:text='{lines[0]}':expansion=none"
                 f":fontsize={fontsize_val}:fontcolor={text_color}"
                 f":borderw=3:bordercolor=black"
                 f":x={x_expr}:y={y1}"
@@ -693,7 +712,7 @@ class VideoEditor:
             else:
                 steps.append(f"{dt1}[__tline1]")
                 steps.append(
-                    f"[__tline1]drawtext={font_arg}:text='{lines[1]}'"
+                    f"[__tline1]drawtext={font_arg}:text='{lines[1]}':expansion=none"
                     f":fontsize={fontsize_val}:fontcolor={text_color}"
                     f":borderw=3:bordercolor=black"
                     f":x={x_expr}:y={y2}"
@@ -712,7 +731,7 @@ class VideoEditor:
             f"drawbox=x=0:y=ih*0.06:w=iw:h=ih/8"
             f":color={bg_color}@{bg_opacity}:t=fill"
             f":enable='{enable}',"
-            f"drawtext={font_arg}:text='{line_join}'"
+            f"drawtext={font_arg}:text='{line_join}':expansion=none"
             f":fontsize={fontsize_val}:fontcolor={text_color}"
             f":borderw=3:bordercolor=black"
             f":x={x_expr}:y=ih*0.06+(ih/8-text_h)/2"
