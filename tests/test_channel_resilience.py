@@ -57,6 +57,7 @@ def _fakes(tmp_path, *, capture_init_fails=0, detector_start_fails=0,
             if state["init_calls"] <= capture_init_fails:
                 raise OSError("streamlink não iniciou")
             self.stopped = False
+            self.discarded = False
             state["captures"].append(self)
 
         def start_recording(self, platform):
@@ -67,8 +68,9 @@ def _fakes(tmp_path, *, capture_init_fails=0, detector_start_fails=0,
         def get_elapsed_seconds(self):
             return 10_000.0
 
-        def stop_recording(self):
+        def stop_recording(self, discard=False):
             self.stopped = True
+            self.discarded = discard
 
     class FakeDetector:
         def __init__(self, cfg, elapsed_fn, platform=None, channel=None):

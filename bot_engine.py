@@ -1275,7 +1275,10 @@ class BotEngine:
                 except Exception as e:
                     logger.debug(f"detector.stop: {e}")
                 try:
-                    capture.stop_recording()
+                    # discard: com detector e captura parados nada mais lê a
+                    # gravação contínua (pendentes vivem em raw_pending_*).
+                    # Antes ela ficava 7 dias: -11,3 GB em 35 min (26/10).
+                    capture.stop_recording(discard=True)
                 except Exception as e:
                     logger.debug(f"capture.stop_recording: {e}")
                 if not _restart_now:

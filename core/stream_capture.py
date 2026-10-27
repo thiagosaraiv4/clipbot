@@ -85,6 +85,42 @@ def _probe_duration(path) -> Optional[float]:
         return None
 
 
+# Windows: o ffmpeg recém-encerrado ainda segura o handle do .ts por instantes.
+_DISCARD_RETRIES     = 5
+_DISCARD_BACKOFF_SEC = 0.2
+
+
+def _discard_recording(path: Path) -> bool:
+    """
+    Apaga a gravação contínua de uma captura encerrada.
+
+    Antes ela ficava até a limpeza do boot (7 dias): na validação de 26/10
+    foram -11,3 GB em 35 min, com o mesmo VOD do YouTube regravado 6 vezes.
+    Se o arquivo não sair, a limpeza do boot recolhe — nunca levanta.
+    """
+    try:
+        size_gb = path.stat().st_size / 1e9
+    except OSError:
+        size_gb = 0.0
+    last_err: Optional[OSError] = None
+    for attempt in range(1, _DISCARD_RETRIES + 1):
+        try:
+            path.unlink(missing_ok=True)
+            logger.info(f"🗑️  Gravação contínua apagada: {path.name} ({size_gb:.2f} GB)")
+            return True
+        except PermissionError as e:
+            last_err = e
+            time.sleep(_DISCARD_BACKOFF_SEC * attempt)
+        except OSError as e:
+            last_err = e
+            break
+    logger.warning(
+        f"⚠️  Gravação contínua não pôde ser apagada ({last_err}); "
+        f"fica para a limpeza do boot: {path.name}"
+    )
+    return False
+
+
 class StreamCapture:
 
     def __init__(self, config: dict, clips_folder: str):
@@ -324,10 +360,14 @@ class StreamCapture:
             logger.info(f"✅ Gravando em: {out_file}")
             return out_file
 
-    def stop_recording(self) -> Path:
+    def stop_recording(self, discard: bool = False) -> Path:
         """
         Para a gravação. _kill_proc faz terminate → wait(5s) → kill.
         Seguro para KeyboardInterrupt no meio do wait.
+
+        discard=True apaga a gravação contínua depois de parar (o engine, ao
+        fim de cada attempt). Os segmentos já recortados (raw_pending_*) são
+        arquivos próprios e ficam. Sem discard o arquivo fica (core/main.py).
         """
         with self._lock:
             if not self.is_recording:
@@ -351,6 +391,8 @@ class StreamCapture:
             self.start_time      = None
             self._unregister()
             logger.info("✅ Gravação encerrada.")
+            if discard and file is not None:
+                _discard_recording(Path(file))
             return file
 
     def get_elapsed_seconds(self) -> float:
