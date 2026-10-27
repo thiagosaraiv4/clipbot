@@ -519,17 +519,26 @@ class VideoEditor:
             return text
         words = text.split()
         lines, cur = [], ""
+        dropped = False
         for w in words:
             nxt = (cur + " " + w).strip()
             if cur and len(nxt) > max_chars:
                 lines.append(cur.strip())
                 cur = w
                 if len(lines) >= max_lines:
+                    dropped = True
                     break
             else:
                 cur = nxt
         if cur and len(lines) < max_lines:
             lines.append(cur.strip())
+        # Palavras que não couberam saíam sem aviso: "ENEM COM O ULT DO GALIO
+        # PRA DAR STUN!" virava "… GALIO PRA DAR" no banner (validação 26/10).
+        if dropped and lines:
+            last = lines[-1]
+            while len(last) + 1 > max_chars and " " in last:
+                last = last.rsplit(" ", 1)[0]
+            lines[-1] = last[:max_chars - 1].rstrip(" ,;:-") + "…"
         # Trunca última linha se ainda for longa
         if lines and len(lines[-1]) > max_chars:
             lines[-1] = lines[-1][:max_chars - 1].rstrip() + "…"

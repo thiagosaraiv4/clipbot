@@ -13,7 +13,9 @@ API:
 
 import logging
 import random
+import re
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -83,6 +85,29 @@ _TEMPLATES = {
         "PRECISAVA SER CLIPPADO!",
     ],
 }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Termos que não vão para o banner
+# ──────────────────────────────────────────────────────────────────────────────
+# O título por Whisper é a fala do streamer; o do LLM sai da mesma fala. Na
+# validação de 26/10 saíram "…WHY DID YOU COMMIT SUICIDE IN 19-!" e "…TÁ RUIM
+# VIADO!". O banner é o primeiro texto que a plataforma e o público leem:
+# autoagressão, ofensa e violência sexual ali derrubam alcance ou a conta.
+# Comparação sem acento, por palavra inteira — "viaduto" e "pedalada" passam.
+_UNSAFE_TITLE_TERMS = (
+    # autoagressão
+    r"suicid\w*", r"se matar", r"me matar", r"kill (?:yo)?urself", r"kys",
+    r"self[- ]?harm", r"automutila\w*",
+    # ofensas
+    r"viad[oa]s?", r"bichas?", r"traveco\w*", r"sapatao", r"retardad[oa]s?",
+    r"mongoloides?", r"nigg\w*", r"fag(?:got)?s?", r"retard(?:ed|s)?", r"trann(?:y|ies)",
+    # violência sexual
+    r"estupr\w*", r"rap(?:e|ed|es|ing)", r"pedof\w*", r"pedo(?:phile)?s?",
+    # extremismo
+    r"nazi\w*", r"hitler",
+)
+_UNSAFE_TITLE_RES = [re.compile(rf"\b{t}\b") for t in _UNSAFE_TITLE_TERMS]
+
 
 _FALLBACK_TITLES = {
     "audio_spike":   "REAÇÃO INSANA NA LIVE!",
@@ -294,6 +319,17 @@ class TitleGenerator:
     # ──────────────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _unsafe_term(title: str) -> Optional[str]:
+        """Termo de _UNSAFE_TITLE_TERMS presente no título, ou None."""
+        norm = "".join(c for c in unicodedata.normalize("NFD", title.lower())
+                       if unicodedata.category(c) != "Mn")
+        for pat in _UNSAFE_TITLE_RES:
+            m = pat.search(norm)
+            if m:
+                return m.group(0)
+        return None
+
+    @staticmethod
     def _fallback_title(reason: str) -> str:
         """Mapa fixo de títulos por reason (última opção)."""
         return _FALLBACK_TITLES.get(reason, "CLIP ÉPICO DA LIVE!")
@@ -362,8 +398,14 @@ class TitleGenerator:
                         transcription, reason, channel=channel,
                         extra_reasons=extra_reasons,
                     )
-                    if score_result and score_result.get("title"):
-                        llm_title = score_result["title"]
+                    llm_title = (score_result or {}).get("title")
+                    unsafe = self._unsafe_term(llm_title) if llm_title else None
+                    if unsafe:
+                        # Metadata fica vazia, como se a cascata tivesse caído.
+                        logger.warning(
+                            f"⚠️  Título do LLM descartado (termo sensível {unsafe!r}): \"{llm_title}\""
+                        )
+                    elif llm_title:
                         # Captura metadata p/ video_editor consumir
                         self.last_subtitle_emojis = score_result.get("subtitle_emojis") or {}
                         self.last_hashtags        = score_result.get("hashtags") or []
@@ -383,7 +425,12 @@ class TitleGenerator:
         if self.use_whisper and raw_clip.exists():
             try:
                 whisper_title = self._whisper_micro(raw_clip)
-                if whisper_title:
+                unsafe = self._unsafe_term(whisper_title) if whisper_title else None
+                if unsafe:
+                    logger.warning(
+                        f"⚠️  Título do Whisper descartado (termo sensível {unsafe!r}): \"{whisper_title}\""
+                    )
+                elif whisper_title:
                     return whisper_title
             except Exception as e:
                 logger.debug(f"Whisper title falhou: {e}")
