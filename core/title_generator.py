@@ -257,28 +257,37 @@ class TitleGenerator:
         """Gera título usando templates variados por reason."""
         templates = _TEMPLATES.get(reason, _TEMPLATES.get("super_moment", ["CLIP ÉPICO!"]))
 
-        # Keyword injection para reason=keyword
-        if reason == "keyword" and keywords:
-            kw = keywords[0].upper() if keywords else "CLIP"
+        kw = None
+        if keywords:
+            kw = keywords[0].upper()
             # Trunca keyword se muito longa
             if len(kw) > 15:
                 kw = kw[:14] + "…"
-            template = random.choice(templates)
-            return template.replace("{kw}", kw)
 
-        # Super moment: combina reasons se disponível
+        if reason == "keyword":
+            return self._pick(templates, kw) or self._fallback_title(reason)
+
+        # Super moment: combina reasons se disponível. O template de keyword
+        # entra no combo com {kw} — antes nunca era preenchido e o banner saía
+        # "O CHAT EXPLODIU + ELE DISSE '{KW}'!" (validação de 26/10).
         if reason == "super_moment" and extra:
             reasons = extra.get("reasons", [])
             if len(reasons) >= 2:
-                r1_templates = _TEMPLATES.get(reasons[0], ["LOUCURA"])
-                r2_templates = _TEMPLATES.get(reasons[1], ["TOTAL"])
-                t1 = random.choice(r1_templates).rstrip("!")
-                t2 = random.choice(r2_templates).rstrip("!")
+                t1 = (self._pick(_TEMPLATES.get(reasons[0], ["LOUCURA"]), kw) or "LOUCURA").rstrip("!")
+                t2 = (self._pick(_TEMPLATES.get(reasons[1], ["TOTAL"]), kw) or "TOTAL").rstrip("!")
                 combo = f"{t1} + {t2}!"
                 if len(combo) <= self.max_title_len:
                     return combo
 
-        return random.choice(templates)
+        return self._pick(templates, kw) or self._fallback_title(reason)
+
+    @staticmethod
+    def _pick(templates: list, kw: Optional[str]) -> Optional[str]:
+        """Sorteia um template; os com {kw} só entram quando há keyword para pôr."""
+        usable = templates if kw else [t for t in templates if "{kw}" not in t]
+        if not usable:
+            return None
+        return random.choice(usable).replace("{kw}", kw or "")
 
     # ──────────────────────────────────────────────────────────────────────
     # Estratégia C: Fallback estático
