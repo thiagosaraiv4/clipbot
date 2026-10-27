@@ -164,7 +164,7 @@ class VideoEditor:
             from whisper_service import WhisperService
             logger.info("🎤 Transcrevendo com Whisper...")
             # device="auto": tenta CUDA INT8_FP16 → CPU INT8 → openai-whisper CPU
-            service = WhisperService.get(size="small", device="auto")
+            service = WhisperService.get(device="auto")
             with _Timer("editor.whisper", backend=service.backend or "unknown"):
                 # word_timestamps=True: necessário para karaoke ASS (Iter2 PR2).
                 # Custo extra ~8× no transcribe mas é único hit por clip.

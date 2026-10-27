@@ -160,9 +160,9 @@ class TitleGenerator:
     def _whisper_micro(self, video_path: Path) -> Optional[str]:
         """
         Transcreve primeiros 5s do clip via Whisper singleton.
-        Reutiliza o MESMO modelo "small" carregado pelo video_editor — em vez
-        de carregar "tiny" separado (que dobrava RAM). Para 5s de áudio, small
-        no CPU custa ~0.5-1s e dá título mais preciso que tiny.
+        Reutiliza o MESMO modelo carregado pelo video_editor
+        (WhisperService.DEFAULT_SIZE) — em vez de carregar um separado, que
+        dobraria a memória.
         """
         if not self.use_whisper:
             return None
@@ -174,7 +174,7 @@ class TitleGenerator:
         try:
             from whisper_service import WhisperService
             # Reusa singleton — mesmo modelo do video_editor (CUDA se disponível)
-            service = WhisperService.get(size="small", device="auto")
+            service = WhisperService.get(device="auto")
             result  = service.transcribe(
                 audio_file, language=self.language,
                 word_timestamps=False, beam_size=1,
@@ -334,7 +334,7 @@ class TitleGenerator:
                 # Reusa Whisper singleton para obter transcrição (já carregado por
                 # video_editor neste ponto do pipeline; warm ~2s).
                 from whisper_service import WhisperService
-                svc = WhisperService.get("small", "auto")
+                svc = WhisperService.get(device="auto")
                 # Transcreve só os primeiros 8s (suficiente p/ hook editorial)
                 tmp_audio = self._extract_short_audio(raw_clip, duration=8.0)
                 if tmp_audio:

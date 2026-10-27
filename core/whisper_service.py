@@ -14,7 +14,9 @@ Por que existe:
   • Singleton mantém modelo em RAM por toda sessão. Lazy-load.
 
 API pública:
-  WhisperService.get(size, device).transcribe(audio_path, ...) → {"segments": [...]}
+  WhisperService.get(device=...).transcribe(audio_path, ...) → {"segments": [...]}
+  Sem `size`, usa DEFAULT_SIZE — o mesmo modelo para legenda, título e hook
+  (um singleton só na VRAM).
 
 Saída de transcribe() segue formato openai-whisper (dict com segments) para
 compatibilidade total com callers existentes.
@@ -39,11 +41,17 @@ class WhisperService:
       "cpu"   — força CPU
     """
 
+    # medium: PT-BR bem mais fiel que small em clips reais ("zero testosterona"
+    # vs "zero texto", "For You" vs "foru"); 1,8× mais lento (~8 s num clip
+    # de 82 s na 1660 S) e +1 GB de VRAM. Ver tests/test_whisper_model_size.py.
+    DEFAULT_SIZE = "medium"
+
     _instances: Dict[tuple, "WhisperService"] = {}
     _class_lock = threading.Lock()
 
     @classmethod
-    def get(cls, size: str = "small", device: str = "auto") -> "WhisperService":
+    def get(cls, size: Optional[str] = None, device: str = "auto") -> "WhisperService":
+        size = size or cls.DEFAULT_SIZE
         # Aceita "cpu" antigo dos callers existentes; mapeamos para "auto" por padrão
         # mas mantemos diferenciação se caller pediu explicitamente "cpu".
         key = (size, device)
