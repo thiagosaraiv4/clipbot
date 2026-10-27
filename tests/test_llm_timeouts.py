@@ -53,13 +53,22 @@ def test_gemini_client_has_an_http_timeout(gemini):
     assert opts.timeout is not None, "http_options sem timeout"
 
 
-def test_gemini_timeout_matches_the_other_providers(gemini):
-    """google-genai mede o timeout em MILISSEGUNDOS; os outros usam segundos."""
+def test_gemini_timeout_is_accepted_by_the_api(gemini):
+    """
+    Validação em produção (26/10): com os mesmos 8 s dos outros providers, o
+    Gemini recusou TODAS as chamadas —
+      400 INVALID_ARGUMENT "Manually set deadline 8s is too short. Minimum
+      allowed deadline is 10s."
+    — e todo título caiu no template. O SDK manda o timeout como deadline do
+    servidor; abaixo de 10 s não há chamada. google-genai mede em ms.
+    """
     import hook_scorer
 
     hook_scorer._GeminiProvider.call("prompt")
 
-    assert gemini["http_options"].timeout == int(hook_scorer._TIMEOUT_SEC * 1000)
+    t = gemini["http_options"].timeout
+    assert t >= 10_000, f"deadline {t} ms < mínimo de 10 s aceito pela API"
+    assert t <= 30_000, f"deadline {t} ms: ainda precisa de teto"
 
 
 def test_gemini_http_options_bound_connect_and_read():

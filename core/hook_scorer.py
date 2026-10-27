@@ -52,6 +52,9 @@ _GEMINI_MODEL    = "gemini-2.5-flash-lite"
 _MAX_TOKENS = 400
 _TRANSCRIPT_CHAR_CAP = 600
 _TIMEOUT_SEC = 8.0
+# A API do Gemini recusa deadline < 10 s (400 INVALID_ARGUMENT, medido em
+# produção em 26/10 com os 8 s acima: todas as chamadas falhavam).
+_GEMINI_MIN_TIMEOUT_SEC = 10.0
 
 _DEFAULT_ORDER = ["anthropic", "openai", "gemini"]
 
@@ -316,7 +319,8 @@ class _GeminiProvider(_BaseProvider):
 
 def _gemini_http_options():
     """
-    Timeout do cliente Gemini, igual ao dos outros providers.
+    Timeout do cliente Gemini: o dos outros providers, mas nunca abaixo do
+    mínimo que a API aceita (o SDK o envia como deadline do servidor).
 
     No google-genai, sem http_options o SDK passa timeout=None ao httpx: nem
     connect nem read têm limite, e uma conexão que cai sem RST bloqueia o recv
@@ -324,7 +328,8 @@ def _gemini_http_options():
     aprovação). Atenção à unidade: aqui o timeout é em MILISSEGUNDOS.
     """
     from google.genai import types as genai_types
-    return genai_types.HttpOptions(timeout=int(_TIMEOUT_SEC * 1000))
+    secs = max(_TIMEOUT_SEC, _GEMINI_MIN_TIMEOUT_SEC)
+    return genai_types.HttpOptions(timeout=int(secs * 1000))
 
 
 _PROVIDERS = {
