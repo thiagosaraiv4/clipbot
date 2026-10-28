@@ -23,9 +23,15 @@ def creds(tmp_path, monkeypatch):
     monkeypatch.setattr(c, "APP_DATA", tmp_path)
     monkeypatch.setattr(c, "CRED_FILE", tmp_path / "credentials.enc")
     monkeypatch.setattr(c, "CONFIG_FILE", tmp_path / "settings.json")
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
     c.reset_storage_health()
+    # A descrição usa os providers do hook_scorer (G2): disponibilidade e
+    # cliente ficam em cache na classe — cada teste com as suas keys.
+    import hook_scorer
+    hook_scorer.HookScorer.reset_cache()
     yield c
+    hook_scorer.HookScorer.reset_cache()
     c.reset_storage_health()
 
 

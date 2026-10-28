@@ -93,7 +93,15 @@ def anthropic_client(monkeypatch):
     built = {}
     # Sem key nenhuma o gerador vai direto ao fallback (B10) e nem cria o
     # cliente — aqui o que se testa é o cliente, então há uma key no ENV.
+    # A descrição usa os providers do hook_scorer (G2), com cache de classe;
+    # só a Anthropic disponível, para o cliente testado ser o dela.
+    import hook_scorer
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-teste")
+    for k in ("OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    for p in ("_GeminiProvider", "_OpenAIProvider"):
+        monkeypatch.setattr(getattr(hook_scorer, p), "is_available", classmethod(lambda cls: False))
+    hook_scorer.HookScorer.reset_cache()
 
     class FakeAnthropic:
         def __init__(self, **kw):
@@ -105,7 +113,8 @@ def anthropic_client(monkeypatch):
             ))
 
     monkeypatch.setattr(anthropic, "Anthropic", FakeAnthropic)
-    return built
+    yield built
+    hook_scorer.HookScorer.reset_cache()
 
 
 def _describe():

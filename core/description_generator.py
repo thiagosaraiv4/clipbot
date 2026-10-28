@@ -1,22 +1,19 @@
 """
 description_generator.py
 Gera título, descrição e hashtags automaticamente usando a transcrição
-do Whisper + Claude API (anthropic).
-Fallback inteligente se a API não estiver disponível.
+do Whisper + a cascata de LLM do hook_scorer (Gemini primeiro).
+Fallback inteligente se nenhum provider estiver disponível.
 """
 
 import logging
-import re
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("ClipBot.Description")
 
-# Teto da chamada de descrição. O padrão do SDK é read de 600 s com 2
-# retentativas — até ~30 min travando quem chamou (thread do canal no modo
-# automático). Com max_retries=1, o pior caso fica em 2 × 15 s.
-_DESC_TIMEOUT_SEC = 15.0
-_DESC_MAX_RETRIES = 1
+# Os tetos de tempo e de retentativas são os dos providers do hook_scorer
+# (B5): antes este módulo tinha cliente próprio — só Anthropic — e, sem
+# crédito ali, toda legenda de post caía no fallback (G2, 28/10).
 
 
 # ------------------------------------------------------------------
@@ -34,12 +31,18 @@ class DescriptionGenerator:
     # ------------------------------------------------------------------
 
     def _transcribe_video(self, video_path: Path) -> str:
-        """Usa Whisper para extrair o texto falado no clip."""
+        """
+        Texto falado no clip, pelo WhisperService do app (mesmo singleton da
+        legenda e do título). Antes era `import whisper` (openai-whisper), que
+        não está instalado: falhava em silêncio e a IA recebia "sem
+        transcrição disponível".
+        """
         try:
-            import whisper
-            model  = whisper.load_model("tiny")   # tiny = rápido para descrição
-            result = model.transcribe(str(video_path), language=self.language)
-            text   = result.get("text", "").strip()
+            from whisper_service import WhisperService
+            result = WhisperService.get(device="auto").transcribe(
+                video_path, language=self.language, word_timestamps=False, beam_size=1,
+            )
+            text   = (result.get("text") or "").strip()
             logger.info(f"🎤 Transcrição para descrição: {text[:80]}...")
             return text
         except Exception as e:
@@ -57,9 +60,9 @@ class DescriptionGenerator:
         channel: str,
         reason: str
     ) -> dict:
-        """Chama a API do Claude para gerar título + descrição + hashtags."""
+        """Pede título + descrição + hashtags à cascata de LLM do hook_scorer."""
         try:
-            import anthropic
+            from hook_scorer import HookScorer, _PROVIDERS
 
             reason_map = {
                 "audio_spike": "momento com reação/grito intenso",
@@ -105,41 +108,23 @@ Regras:
 - Hashtags em {lang_label} misturado com inglês popular (#fyp, #viral)
 - NÃO invente contexto que não está na transcrição"""
 
-            # Mesma cascata de keys do hook_scorer (ENV → credentials.enc →
-            # settings.json). Sem api_key explícita o SDK só olha o ENV, e a
-            # key salva pela UI nunca chegava aqui: toda legenda de post caía
-            # no _fallback genérico.
-            from hook_scorer import _load_key
-            key = _load_key(
-                "ANTHROPIC_API_KEY",
-                ["anthropic_api_key"],
-                ["system", "anthropic_api_key"],
-            )
-            if not key:
-                logger.debug("sem key da Anthropic — usando fallback")
-                return {}
+            # Mesma cascata do título: ordem, keys (ENV → credentials.enc →
+            # settings.json, B10) e tetos de tempo. Provider sem SDK ou sem
+            # key nem é chamado.
+            for name in HookScorer._provider_order():
+                provider = _PROVIDERS.get(name)
+                if not provider or not provider.is_available():
+                    continue
+                raw  = provider.call(prompt)
+                data = HookScorer._parse_json(raw) if raw else None
+                if data and data.get("title") and data.get("description"):
+                    logger.info(f"✨ Descrição gerada por IA[{name}] para {platform}: {data['title']}")
+                    return data
+                logger.debug(f"descrição: {name} sem resposta válida, próximo provider")
 
-            client = anthropic.Anthropic(
-                api_key=key, timeout=_DESC_TIMEOUT_SEC, max_retries=_DESC_MAX_RETRIES,
-            )
-            msg    = client.messages.create(
-                model="claude-haiku-4-5-20251001",   # rápido e barato
-                max_tokens=400,
-                messages=[{"role": "user", "content": prompt}]
-            )
-
-            raw  = msg.content[0].text.strip()
-            # Remove possível markdown ```json ... ```
-            raw  = re.sub(r"```json|```", "", raw).strip()
-            import json
-            data = json.loads(raw)
-
-            logger.info(f"✨ Descrição gerada por IA para {platform}: {data['title']}")
-            return data
-
-        except ImportError:
-            logger.debug("anthropic não instalado — usando fallback")
+            logger.debug("nenhum provider de LLM gerou descrição — usando fallback")
             return {}
+
         except Exception as e:
             logger.debug(f"IA falhou ({e}) — usando fallback")
             return {}

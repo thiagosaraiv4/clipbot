@@ -55,6 +55,10 @@ _TIMEOUT_SEC = 8.0
 # A API do Gemini recusa deadline < 10 s (400 INVALID_ARGUMENT, medido em
 # produção em 26/10 com os 8 s acima: todas as chamadas falhavam).
 _GEMINI_MIN_TIMEOUT_SEC = 10.0
+# Padrão dos SDKs Anthropic/OpenAI = 2 retentativas (3 × o timeout no pior
+# caso). 1 basta para um soluço de rede; a descrição de post usa estes
+# mesmos clientes (G2) e já tinha esse teto (B5).
+_MAX_RETRIES = 1
 
 # Gemini primeiro: é o único com free tier, e o usuário não tem crédito na
 # Anthropic/OpenAI (28/10) — na ordem antiga cada clip pagava ~5 s e 2 erros
@@ -226,7 +230,8 @@ class _AnthropicProvider(_BaseProvider):
                     ["anthropic_api_key"],
                     ["system", "anthropic_api_key"],
                 )
-                cls._client = anthropic.Anthropic(api_key=key, timeout=_TIMEOUT_SEC)
+                cls._client = anthropic.Anthropic(api_key=key, timeout=_TIMEOUT_SEC,
+                                                  max_retries=_MAX_RETRIES)
             msg = cls._client.messages.create(
                 model=_ANTHROPIC_MODEL,
                 max_tokens=_MAX_TOKENS,
@@ -264,7 +269,7 @@ class _OpenAIProvider(_BaseProvider):
                     ["openai_api_key"],
                     ["system", "openai_api_key"],
                 )
-                cls._client = OpenAI(api_key=key, timeout=_TIMEOUT_SEC)
+                cls._client = OpenAI(api_key=key, timeout=_TIMEOUT_SEC, max_retries=_MAX_RETRIES)
             resp = cls._client.chat.completions.create(
                 model=_OPENAI_MODEL,
                 max_tokens=_MAX_TOKENS,
