@@ -1,10 +1,10 @@
 """
 core/hook_scorer.py — Iter2 PR3: Re-ranking + título via LLM cascata.
 
-Cascata de 3 providers (ordem padrão):
-  1. Anthropic Claude Haiku 4.5      (melhor qualidade editorial)
-  2. OpenAI gpt-4o-mini              (fallback se Anthropic sem créditos)
-  3. Google Gemini 2.0 Flash         (fallback final, free tier 1500 req/dia)
+Cascata de 3 providers (ordem padrão, ver _DEFAULT_ORDER):
+  1. Google Gemini 2.5 Flash-Lite    (free tier; único em uso desde 28/10)
+  2. Anthropic Claude Haiku 4.5      (reserva, se tiver crédito)
+  3. OpenAI gpt-4o-mini              (reserva, se tiver crédito)
 
 Por que existe:
   Hoje títulos vêm de templates estáticos (`title_generator._TEMPLATES`) ou de
@@ -56,7 +56,11 @@ _TIMEOUT_SEC = 8.0
 # produção em 26/10 com os 8 s acima: todas as chamadas falhavam).
 _GEMINI_MIN_TIMEOUT_SEC = 10.0
 
-_DEFAULT_ORDER = ["anthropic", "openai", "gemini"]
+# Gemini primeiro: é o único com free tier, e o usuário não tem crédito na
+# Anthropic/OpenAI (28/10) — na ordem antiga cada clip pagava ~5 s e 2 erros
+# antes de chegar nele. Os outros ficam de reserva. Override por
+# settings.json → editing.hook_scorer.providers.
+_DEFAULT_ORDER = ["gemini", "anthropic", "openai"]
 
 
 _REASON_LABELS = {
